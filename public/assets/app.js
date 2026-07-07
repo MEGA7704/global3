@@ -377,7 +377,14 @@ async function readJsonResponse(r){
     }
     throw new Error('Réponse API invalide : JSON attendu.');
   }
-  if(!r.ok || j.success===false || j.ok===false){throw new Error(j.message||j.error||('Erreur serveur '+r.status));}
+  if(!r.ok || j.success===false || j.ok===false){
+    const parts=[];
+    if(j.message||j.error) parts.push(j.message||j.error);
+    if(Array.isArray(j.errors)&&j.errors.length) parts.push('Erreurs serveur : '+j.errors.join(' | '));
+    if(Array.isArray(j.warnings)&&j.warnings.length) parts.push('Avertissements : '+j.warnings.join(' | '));
+    if(j.bindings) parts.push('Bindings détectés : KV='+((j.bindings&&j.bindings.kvName)||'non détecté')+', D1='+((j.bindings&&j.bindings.d1Name)||'non détecté'));
+    throw new Error(parts.join('\n')||('Erreur serveur '+r.status));
+  }
   return j;
 }
 function cloudErrorMessage(e){return (e&&e.message)?e.message:String(e||'Enregistrement en ligne impossible')}
@@ -432,7 +439,12 @@ function saveOnlineBlocking(payload){
       throw new Error('Réponse API invalide : JSON attendu.');
     }
   if(xhr.status<200||xhr.status>=300||!isCloudSyncedResult(j)){
-    throw new Error((j&&j.message)||'Sauvegarde KV/D1 non confirmée');
+    const parts=[];
+    if(j&&j.message) parts.push(j.message);
+    if(j&&Array.isArray(j.errors)&&j.errors.length) parts.push('Erreurs serveur : '+j.errors.join(' | '));
+    if(j&&Array.isArray(j.warnings)&&j.warnings.length) parts.push('Avertissements : '+j.warnings.join(' | '));
+    if(j&&j.bindings) parts.push('Bindings détectés : KV='+((j.bindings&&j.bindings.kvName)||'non détecté')+', D1='+((j.bindings&&j.bindings.d1Name)||'non détecté'));
+    throw new Error(parts.join('\n')||'Sauvegarde KV/D1 non confirmée');
   }
   return j;
 }

@@ -24,9 +24,10 @@ export async function onRequestGet({ env }) {
   try {
     const key = 'global3:health';
     await kv.put(key, JSON.stringify({ ok: true, at: result.checkedAt }), { metadata: { checkedAt: result.checkedAt } });
-    const raw = await kv.get(key);
-    result.kv = { ok: !!raw, binding: status.kvName };
-    if (raw) result.storage.push('KV');
+    let raw = null;
+    try { raw = await kv.get(key); } catch (_verifyError) { raw = null; }
+    result.kv = { ok: true, binding: status.kvName, put: true, verified: !!raw };
+    result.storage.push('KV');
   } catch (error) {
     result.kv = { ok: false, binding: status.kvName, message: error.message || String(error) };
   }

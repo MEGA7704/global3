@@ -33,8 +33,12 @@ export async function onRequestPost({ request, env }) {
   const updatedAt = String(body.updatedAt || data.__lastModifiedAt || nowIso());
   const value = JSON.stringify(Object.assign({}, data, { __lastModifiedAt: updatedAt }));
   let d1Saved = false;
+  let d1MainSaved = false;
+  let d1BackupSaved = false;
   let kvSaved = false;
+  let kvVerified = false;
   const errors = [];
+  const warnings = [];
 
   try {
     await ensureD1Schema(db);
@@ -43,25 +47,46 @@ export async function onRequestPost({ request, env }) {
       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at, source = 'api-online-only'`)
       .bind(key, value, updatedAt)
       .run();
-    await db.prepare('INSERT INTO global3_backups(key, value, updated_at, created_at, source) VALUES (?1, ?2, ?3, ?4, ?5)')
-      .bind(key, value, updatedAt, nowIso(), 'api-online-only')
-      .run();
-    d1Saved = true;
+    const check = await db.prepare('SELECT updated_at FROM global3_data WHERE key = ?1').bind(key).first();
+    d1MainSaved = !!check;
+    d1Saved = d1MainSaved;
+    if (!d1MainSaved) errors.push('D1: écriture principale non retrouvée après sauvegarde');
   } catch (error) {
-    errors.push('D1: ' + (error.message || String(error)));
+    errors.push('D1 principal: ' + (error.message || String(error)));
+  }
+
+  if (d1MainSaved) {
+    try {
+      await db.prepare('INSERT INTO global3_backups(key, value, updated_at, created_at, source) VALUES (?1, ?2, ?3, ?4, ?5)')
+        .bind(key, value, updatedAt, nowIso(), 'api-online-only')
+        .run();
+      d1BackupSaved = true;
+    } catch (error) {
+      // La sauvegarde historique est utile, mais elle ne doit pas refuser l'enregistrement principal
+      // si KV et la table D1 principale ont bien confirmé l'écriture.
+      warnings.push('D1 backup: ' + (error.message || String(error)));
+    }
   }
 
   try {
     await kv.put(key, value, { metadata: { updatedAt, source: 'api-online-only' } });
-    const verification = await kv.get(key);
-    kvSaved = !!verification;
-    if (!kvSaved) errors.push('KV: lecture de vérification impossible');
+    kvSaved = true;
+    try {
+      const verification = await kv.get(key);
+      kvVerified = !!verification;
+      if (!kvVerified) warnings.push('KV: écriture acceptée, lecture immédiate non disponible');
+    } catch (verifyError) {
+      warnings.push('KV vérification: ' + (verifyError.message || String(verifyError)));
+    }
   } catch (error) {
     errors.push('KV: ' + (error.message || String(error)));
   }
 
   const saved = kvSaved && d1Saved;
-  await logEvent(db, saved ? 'save_online_confirmed' : 'save_online_failed', saved ? 'Sauvegarde KV + D1 confirmée' : errors.join(' | '));
+  const diagnostic = saved
+    ? 'Sauvegarde KV + D1 confirmée'
+    : errors.join(' | ');
+  await logEvent(db, saved ? 'save_online_confirmed' : 'save_online_failed', diagnostic);
 
   return json({
     success: saved,
@@ -70,9 +95,15 @@ export async function onRequestPost({ request, env }) {
     cloud: saved,
     onlineOnly: true,
     kvSaved,
+    kvVerified,
     d1Saved,
+    d1MainSaved,
+    d1BackupSaved,
     bindings: status,
     errors,
-    message: saved ? 'Enregistrement en ligne confirmé dans KV + D1.' : 'Enregistrement en ligne non confirmé. Les données ne doivent pas être considérées comme enregistrées.'
+    warnings,
+    message: saved
+      ? 'Enregistrement en ligne confirmé dans KV + D1.'
+      : 'Enregistrement en ligne non confirmé. Les données ne doivent pas être considérées comme enregistrées.'
   }, saved ? 200 : 503);
 }
