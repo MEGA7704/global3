@@ -1,0 +1,19 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "global3-cloud-backup",
+  "compatibility_date": "2026-07-07",
+  "pages_build_output_dir": "public",
+  "kv_namespaces": [
+    {
+      "binding": "GLOBAL3_KV",
+      "id": "af2392587bf942708e12a1bf1a00c851"
+    }
+  ],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "global3-database",
+      "database_id": "86a1b712-24ff-4ef9-a0b1-dbe9eae0c93d"
+    }
+  ]
+}
