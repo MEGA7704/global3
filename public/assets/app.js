@@ -393,7 +393,7 @@ function onlineRequiredMessage(error){
   if(/API Cloudflare non déployée|page HTML|JSON attendu|API invalide/i.test(detail)){
     return 'API Cloudflare non active. Les routes /api/health, /api/save et /api/load ne répondent pas en JSON.\n\nCause probable : le ZIP a été envoyé par dépôt direct dans le tableau de bord Cloudflare, ce qui n’active pas les Pages Functions. Déployez par GitHub ou par Wrangler.\n\nDétail : '+detail;
   }
-  return 'Enregistrement en ligne impossible. Vérifiez Internet et les bindings Cloudflare GLOBAL3_KV + GLOBAL3_DB, puis réessayez.\n\nDétail : '+detail;
+  return 'Enregistrement en ligne impossible. Vérifiez Internet et les bindings Cloudflare KV + D1, puis réessayez. Noms recommandés : GLOBAL3_KV + GLOBAL3_DB.\n\nDétail : '+detail;
 }
 function isCloudSyncedResult(j){return !!(j&&(j.success||j.ok)&&j.saved===true&&j.kvSaved===true&&j.d1Saved===true);}
 function showOnlineOnlyScreen(error){

@@ -1,4 +1,4 @@
-import { chooseNewest, bindingStatus, ensureD1Schema, getD1, getKV, json, parseJsonSafe, safeKey, DATA_KEY_DEFAULT } from '../_utils.js';
+import { chooseNewest, bindingStatus, getD1, getKV, json, parseJsonSafe, safeKey, DATA_KEY_DEFAULT, readLargeJsonFromD1, saveLargeJsonToD1, nowIso } from '../_utils.js';
 
 export async function onRequestGet({ request, env }) {
   const url = new URL(request.url);
@@ -15,16 +15,27 @@ export async function onRequestGet({ request, env }) {
       data: null,
       found: false,
       bindings: status,
-      message: 'Chargement en ligne impossible : GLOBAL3_KV et GLOBAL3_DB sont obligatoires.'
+      message: 'Chargement en ligne impossible : un binding KV et un binding D1 sont obligatoires.'
     }, 503);
   }
 
-  await ensureD1Schema(db);
+  const errors = [];
+  let kvData = null;
+  let d1Data = null;
 
-  const rawKv = await kv.get(key);
-  const kvData = parseJsonSafe(rawKv);
-  const row = await db.prepare('SELECT value FROM global3_data WHERE key = ?1').bind(key).first();
-  const d1Data = parseJsonSafe(row && row.value);
+  try {
+    const rawKv = await kv.get(key);
+    kvData = parseJsonSafe(rawKv);
+  } catch (error) {
+    errors.push('KV lecture: ' + (error.message || String(error)));
+  }
+
+  try {
+    d1Data = await readLargeJsonFromD1(db, key);
+  } catch (error) {
+    errors.push('D1 lecture chunkée: ' + (error.message || String(error)));
+  }
+
   const data = chooseNewest(kvData, d1Data);
   const sources = [];
   if (kvData) sources.push('KV');
@@ -32,15 +43,13 @@ export async function onRequestGet({ request, env }) {
 
   // Réparation automatique si une source est vide mais l'autre possède les données.
   if (data && !kvData) {
-    await kv.put(key, JSON.stringify(data), { metadata: { repairedAt: new Date().toISOString(), source: 'repair-from-d1' } });
+    await kv.put(key, JSON.stringify(data), { metadata: { repairedAt: nowIso(), source: 'repair-from-d1' } });
+    sources.push('KV-réparé');
   }
   if (data && !d1Data) {
-    const updatedAt = String(data.__lastModifiedAt || new Date().toISOString());
-    await db.prepare(`INSERT INTO global3_data(key, value, updated_at, source)
-      VALUES (?1, ?2, ?3, 'repair-from-kv')
-      ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at, source = 'repair-from-kv'`)
-      .bind(key, JSON.stringify(data), updatedAt)
-      .run();
+    const updatedAt = String(data.__lastModifiedAt || nowIso());
+    await saveLargeJsonToD1(db, key, JSON.stringify(data), updatedAt, 'repair-from-kv-chunked');
+    sources.push('D1-réparé');
   }
 
   return json({
@@ -50,8 +59,10 @@ export async function onRequestGet({ request, env }) {
     data,
     found: !!data,
     source: sources.join('+') || 'none',
+    storageMode: 'kv-full-plus-d1-chunks',
     bindings: status,
     onlineOnly: true,
+    errors,
     message: data ? 'Données en ligne chargées depuis KV/D1.' : 'KV + D1 prêts. Aucune donnée existante.'
   });
 }

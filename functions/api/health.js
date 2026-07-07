@@ -8,7 +8,7 @@ export async function onRequestGet({ env }) {
     success: false,
     ok: false,
     app: 'GLOBAL 3',
-    mode: 'online-only-kv-d1',
+    mode: 'online-only-kv-d1-chunked',
     storage: [],
     bindings: status,
     checkedAt: nowIso()
@@ -17,7 +17,7 @@ export async function onRequestGet({ env }) {
   if (!status.kv || !status.d1) {
     result.kv = { ok: !!status.kv, binding: status.kvName, message: status.kv ? 'Binding KV présent' : 'Binding KV non configuré' };
     result.d1 = { ok: !!status.d1, binding: status.d1Name, message: status.d1 ? 'Binding D1 présent' : 'Binding D1 non configuré' };
-    result.message = 'Mode en ligne obligatoire : GLOBAL3_KV et GLOBAL3_DB doivent être liés ensemble.';
+    result.message = 'Mode en ligne obligatoire : un binding KV et un binding D1 doivent être liés au projet Pages. Noms recommandés : GLOBAL3_KV + GLOBAL3_DB.';
     return json(result, 503);
   }
 
@@ -42,7 +42,7 @@ export async function onRequestGet({ env }) {
   }
 
   result.ok = result.success = !!(result.kv && result.kv.ok && result.d1 && result.d1.ok);
-  result.message = result.ok ? 'KV + D1 disponibles. Enregistrements en ligne activés.' : 'KV + D1 non confirmés. Les enregistrements doivent rester refusés.';
+  result.message = result.ok ? 'KV + D1 disponibles. Enregistrements en ligne activés avec D1 chunké.' : 'KV + D1 non confirmés. Les enregistrements doivent rester refusés.';
   if (result.ok) await logEvent(db, 'health_online_only', 'Contrôle KV + D1 réussi');
 
   return json(result, result.ok ? 200 : 503);

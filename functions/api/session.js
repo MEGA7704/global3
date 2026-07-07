@@ -11,7 +11,7 @@ export async function onRequestGet({ request, env }) {
   const { status, ok } = requireBindings(env);
   const kv = getKV(env);
   const db = getD1(env);
-  if (!ok) return json({ success: false, ok: false, session: null, source: 'none', bindings: status, message: 'Session en ligne indisponible : GLOBAL3_KV et GLOBAL3_DB obligatoires.' }, 503);
+  if (!ok) return json({ success: false, ok: false, session: null, source: 'none', bindings: status, message: 'Session en ligne indisponible : binding KV et binding D1 obligatoires.' }, 503);
 
   let session = parseJsonSafe(await kv.get(key));
   let source = session ? 'KV' : 'none';
@@ -30,7 +30,7 @@ export async function onRequestPost({ request, env }) {
   const { status, ok } = requireBindings(env);
   const kv = getKV(env);
   const db = getD1(env);
-  if (!ok) return json({ success: false, ok: false, saved: false, bindings: status, message: 'Session en ligne non enregistrée : GLOBAL3_KV et GLOBAL3_DB obligatoires.' }, 503);
+  if (!ok) return json({ success: false, ok: false, saved: false, bindings: status, message: 'Session en ligne non enregistrée : binding KV et binding D1 obligatoires.' }, 503);
 
   const body = await readJsonBody(request);
   const key = safeKey(body.key, SESSION_KEY_DEFAULT);
@@ -55,7 +55,7 @@ export async function onRequestDelete({ request, env }) {
   const { status, ok } = requireBindings(env);
   const kv = getKV(env);
   const db = getD1(env);
-  if (!ok) return json({ success: false, ok: false, deleted: false, bindings: status, message: 'Session en ligne indisponible : GLOBAL3_KV et GLOBAL3_DB obligatoires.' }, 503);
+  if (!ok) return json({ success: false, ok: false, deleted: false, bindings: status, message: 'Session en ligne indisponible : binding KV et binding D1 obligatoires.' }, 503);
 
   await kv.delete(key);
   await ensureD1Schema(db);

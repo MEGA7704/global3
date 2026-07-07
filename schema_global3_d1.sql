@@ -5,6 +5,18 @@ CREATE TABLE IF NOT EXISTS global3_data (
   source TEXT DEFAULT 'api-online-only'
 );
 
+CREATE TABLE IF NOT EXISTS global3_chunks (
+  key TEXT NOT NULL,
+  version TEXT NOT NULL,
+  part_index INTEGER NOT NULL,
+  value TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (key, version, part_index)
+);
+
+CREATE INDEX IF NOT EXISTS idx_global3_chunks_key_version
+ON global3_chunks(key, version);
+
 CREATE TABLE IF NOT EXISTS global3_backups (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   key TEXT NOT NULL,
