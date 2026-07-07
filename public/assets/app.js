@@ -350,6 +350,12 @@ function cacheConfirmedCloudData(d){
   CLOUD_DATA=payload;
   return payload;
 }
+function cloudSyncLabel(){
+  if(CLOUD_SAVE_IN_PROGRESS) return '☁️ Enregistrement KV/D1...';
+  if(!isCloudOnline()) return '⚠️ Hors ligne — enregistrement impossible';
+  if(CLOUD_DATA) return '☁️ En ligne KV/D1';
+  return '☁️ Connexion KV/D1...';
+}
 function updateCloudSyncBadge(txt){const el=document.getElementById('syncBadge'); if(el) el.textContent=txt||'☁️ En ligne KV/D1';}
 function currentDashboardSection(){return document.querySelector('.section.active')?.id || 'home'}
 function isUserEditingForm(){const a=document.activeElement; return !!(a && ['INPUT','TEXTAREA','SELECT'].includes(a.tagName));}
