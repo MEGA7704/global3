@@ -1,0 +1,10 @@
+name = "global3-saas-kv-d1"
+compatibility_date = "2026-07-07"
+pages_build_output_dir = "public"
+
+# IMPORTANT
+# Ce fichier garde le projet propre pour Cloudflare Pages.
+# Les bindings KV/D1 peuvent être ajoutés dans le tableau de bord Cloudflare Pages :
+# Settings > Functions > Bindings
+# - KV namespace binding : GLOBAL3_KV
+# - D1 database binding  : GLOBAL3_DB

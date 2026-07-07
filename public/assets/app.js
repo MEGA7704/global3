@@ -271,7 +271,7 @@ function obligationPeriodControls(){
   const y=getObligationYear(), m=getObligationMonth();
   const opts=monthsList.map((name,i)=>`<option value="${i}" ${i===m?'selected':''}>${esc(name)}</option>`).join('');
   return `<div class="obligationPeriodBox no-print">
-    <div class="obligationPeriodTitle"><span>Mois affiché : ${esc(monthsList[m])} ${y}</span></div>
+    <div class="obligationPeriodTitle"><b>Sélection des obligations par mois</b><span>Mois affiché : ${esc(monthsList[m])} ${y}</span></div>
     <div class="obligationPeriodGrid">
       <button class="btn2" onclick="setObligationPeriod(-1)">← Mois précédent</button>
       <label>Année des obligations<input id="obligationYear" type="number" value="${y}" onchange="applyObligationPeriod()" min="2000" max="2100"></label>
@@ -293,86 +293,241 @@ function setManageYear(delta){if(!requireAdmin()) return; saveManagementPeriod(g
 function applyManagementYear(){if(!requireAdmin()) return;if(!ensureDataUnlocked('la modification de l’année et du mois de gestion')) return;const y=Math.max(1,Number($('#managementYear')?.value||new Date().getFullYear())); const m=Math.max(0,Math.min(11,Number($('#managementMonth')?.value||0))); saveManagementPeriod(y,m); renderDash('mois'); g3ProInfo('Année du résumé appliquée au tableau de gestion 12 mois, sans verrouiller les ventes.','Résumé appliqué')}
 function openManagementMonth(i){const y=getManageYear(); const m=String(Number(i)+1).padStart(2,'0'); savePeriodFilter('report',{type:'month',month:String(y)+'-'+m,year:String(y)}); renderDash('rapports')}
 const esc=s=>String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+
+async function sha256Text(text){
+  const data=new TextEncoder().encode(String(text||''));
+  const digest=await crypto.subtle.digest('SHA-256',data);
+  return Array.from(new Uint8Array(digest)).map(b=>b.toString(16).padStart(2,'0')).join('');
+}
+async function buildPasswordHash(password,salt=''){
+  salt=salt||randomPart(16)+Date.now().toString(36);
+  return 'sha256$'+salt+'$'+await sha256Text(salt+'|GLOBAL3|'+String(password||''));
+}
+async function setUserPasswordSecure(user,password){
+  if(!user) return;
+  user.passwordHash=await buildPasswordHash(password||'1234');
+  delete user.password;
+}
+async function verifyUserPassword(user,password){
+  if(!user) return false;
+  if(user.passwordHash){
+    const parts=String(user.passwordHash).split('$');
+    if(parts.length===3 && parts[0]==='sha256') return await buildPasswordHash(password,parts[1])===user.passwordHash;
+  }
+  return String(user.password||'')===String(password||'');
+}
+async function migratePasswordIfPlain(user,password,d){
+  if(user && !user.passwordHash && String(user.password||'')===String(password||'')){
+    await setUserPasswordSecure(user,password);
+    if(d) save(d);
+  }
+}
+function passwordFieldPlaceholder(u){return u?.passwordHash?'••••••••':''}
+
+
+// ================================================================
+// GLOBAL 3 — MODE EN LIGNE OBLIGATOIRE KV + D1
+// Règle métier : aucun enregistrement n'est validé uniquement en local.
+// 1) Chargement depuis Cloudflare KV/D1 au démarrage ;
+// 2) Sauvegarde directe et confirmée par /api/save ;
+// 3) Cache navigateur seulement après confirmation en ligne.
+// ================================================================
 const CLOUD_KEY='global3_all';
 let CLOUD_DATA=null;
 let CLOUD_SESSION=null;
-let CLOUD_SAVE_TIMER=null;
-let CLOUD_SYNC_TIMER=null;
 let CLOUD_SAVE_IN_PROGRESS=false;
 let CLOUD_LAST_REMOTE_SIGNATURE='';
-function defaultData(){return {companies:[],users:[{id:'super',companyId:null,name:'MEGA SERVICES DIABO',email:'mega@services.local',password:'admin123',role:'superadmin',status:'active'}],items:[],sales:[],payments:[],loginAttempts:{}}}
+const CLOUD_API_BASE='/api';
+const CLOUD_DATA_KEY='global3:data';
+const CLOUD_SESSION_KEY='global3:session';
+const CLOUD_TIMEOUT_MS=12000;
+function defaultData(){return {companies:[],users:[{id:'super',companyId:null,name:'MEGA SERVICES DIABO',email:'mega@services.local',passwordHash:'sha256$G3_DEFAULT_SUPERADMIN_2026$6a8e54d650efaa5902cc6d5e9be24bce19060ee29d8e892d7eb23b76262a41b1',role:'superadmin',status:'active',mustChangePassword:true,createdAt:new Date().toISOString()}],items:[],sales:[],payments:[],loginAttempts:{}}}
 function stableDataSignature(d){try{return JSON.stringify(d||{});}catch(e){return String(Date.now())}}
-function mergeArrayByKey(remoteArr=[],localArr=[],keyName='id') {
-  const out=[]; const map=new Map();
-  function keyOf(x){return String((x&&x[keyName])||(x&&x.ref)||(x&&x.email)||(x&&x.code)||stableDataSignature(x));}
-  function put(x,preferLocal=false){
-    if(!x||typeof x!=='object') return;
-    const k=keyOf(x); const old=map.get(k);
-    if(!old){map.set(k,Object.assign({},x)); return;}
-    const oldTime=Date.parse(old.updatedAt||old.modifiedAt||old.validatedAt||old.createdAt||old.date||0)||0;
-    const newTime=Date.parse(x.updatedAt||x.modifiedAt||x.validatedAt||x.createdAt||x.date||0)||0;
-    const merged=Object.assign({},old,x);
-    if(preferLocal || newTime>=oldTime) map.set(k,merged);
-    else map.set(k,Object.assign({},merged,old));
-  }
-  (remoteArr||[]).forEach(x=>put(x,false));
-  (localArr||[]).forEach(x=>put(x,true));
-  map.forEach(v=>out.push(v));
-  return out;
+function normalizeData(d){d=d&&typeof d==='object'?d:{}; if(d.data&&typeof d.data==='object') d=d.data; const base=defaultData(); const out=Object.assign({},base,d,{companies:Array.isArray(d.companies)?d.companies:[],users:Array.isArray(d.users)?d.users:base.users,items:Array.isArray(d.items)?d.items:[],sales:Array.isArray(d.sales)?d.sales:[],payments:Array.isArray(d.payments)?d.payments:[],loginAttempts:d.loginAttempts||{}}); if(!out.users.some(u=>u.id==='super'||u.role==='superadmin')) out.users.unshift(base.users[0]); return out;}
+function localMainDataKey(){return K}
+function localSessionKey(){return S}
+function readJsonLocal(key){try{const raw=localStorage.getItem(key); return raw?JSON.parse(raw):null;}catch(e){return null}}
+function writeJsonLocal(key,value){try{localStorage.setItem(key,JSON.stringify(value)); return true;}catch(e){console.warn('Cache navigateur impossible:',e); return false}}
+function removeJsonLocal(key){try{localStorage.removeItem(key);}catch(e){}}
+function readLocalDataOnly(){return normalizeData(readJsonLocal(localMainDataKey())||defaultData())}
+function cacheConfirmedCloudData(d){
+  const payload=normalizeData(Object.assign({},d||{}, {__lastModifiedAt:(d&&d.__lastModifiedAt)||new Date().toISOString()}));
+  CLOUD_DATA=payload;
+  writeJsonLocal(localMainDataKey(),payload);
+  return payload;
 }
-function mergeCloudData(remote,local){
-  remote=normalizeData(remote); local=normalizeData(local);
-  const merged=Object.assign({},remote,local);
-  const keys=new Set([...Object.keys(remote),...Object.keys(local)]);
-  keys.forEach(k=>{
-    if(Array.isArray(remote[k])||Array.isArray(local[k])) merged[k]=mergeArrayByKey(remote[k]||[],local[k]||[],k==='users'?'email':'id');
-    else if(remote[k]&&local[k]&&typeof remote[k]==='object'&&typeof local[k]==='object') merged[k]=Object.assign({},remote[k],local[k]);
-  });
-  merged.__lastModifiedAt=new Date().toISOString();
-  return normalizeData(merged);
-}
-function cloudSyncLabel(){return CLOUD_SAVE_IN_PROGRESS?'🔄 Synchronisation...':'🔄 Synchronisé multi-appareils'}
-function updateCloudSyncBadge(txt){const el=document.getElementById('syncBadge'); if(el) el.textContent=txt||cloudSyncLabel();}
+function updateCloudSyncBadge(txt){const el=document.getElementById('syncBadge'); if(el) el.textContent=txt||'☁️ En ligne KV/D1';}
 function currentDashboardSection(){return document.querySelector('.section.active')?.id || 'home'}
 function isUserEditingForm(){const a=document.activeElement; return !!(a && ['INPUT','TEXTAREA','SELECT'].includes(a.tagName));}
-async function cloudPullLatest({rerender=false,silent=true}={}){
-  try{
-    const r=await fetchWithTimeout('/api/load?companyId='+encodeURIComponent(CLOUD_KEY)+'&t='+Date.now(),{cache:'no-store'},6500);
-    if(!r.ok) throw new Error('Chargement cloud: '+r.status);
-    const remote=normalizeData(await r.json().catch(()=>({})));
-    const sig=stableDataSignature(remote);
-    if(sig && sig!==CLOUD_LAST_REMOTE_SIGNATURE){
-      const before=stableDataSignature(CLOUD_DATA||{});
-      CLOUD_LAST_REMOTE_SIGNATURE=sig;
-      CLOUD_DATA=mergeCloudData(remote,CLOUD_DATA||{});
-      rememberCloudCache(CLOUD_DATA);
-      if(rerender && session() && before!==stableDataSignature(CLOUD_DATA) && !isUserEditingForm()){const cur=current(); if(cur.user?.role==='superadmin') renderSuper(); else if(cur.user&&cur.company) renderDash(currentDashboardSection());}
+function isCloudOnline(){try{return typeof navigator==='undefined' || navigator.onLine!==false;}catch(e){return true}}
+function writeLocalSession(x){try{x?localStorage.setItem(localSessionKey(),JSON.stringify(x)):localStorage.removeItem(localSessionKey());}catch(e){}}
+function readLocalSession(){try{const raw=localStorage.getItem(localSessionKey()); return raw?JSON.parse(raw):null;}catch(e){return null}}
+async function fetchWithTimeout(url,opts={},ms=CLOUD_TIMEOUT_MS){
+  const ctrl=new AbortController();
+  const t=setTimeout(()=>ctrl.abort(),ms);
+  try{return await fetch(url,Object.assign({cache:'no-store',signal:ctrl.signal},opts));}
+  finally{clearTimeout(t)}
+}
+async function readJsonResponse(r){
+  const text=await r.text();
+  let j=null;
+  try{j=text?JSON.parse(text):{};}catch(e){
+    if ((text||'').trim().startsWith('<') || (r.headers.get('content-type')||'').includes('text/html')) {
+      throw new Error('API Cloudflare non déployée : la route /api renvoie une page HTML. Déployez le projet via GitHub ou Wrangler, pas par dépôt ZIP direct du tableau de bord.');
     }
-    updateCloudSyncBadge('🔄 Données à jour');
-    return CLOUD_DATA;
-  }catch(e){if(!silent) console.warn(e); updateCloudSyncBadge('⚠️ Synchro locale'); return CLOUD_DATA;}
+    throw new Error('Réponse API invalide : JSON attendu.');
+  }
+  if(!r.ok || j.success===false || j.ok===false){throw new Error(j.message||j.error||('Erreur serveur '+r.status));}
+  return j;
+}
+function cloudErrorMessage(e){return (e&&e.message)?e.message:String(e||'Enregistrement en ligne impossible')}
+function onlineRequiredMessage(error){
+  const detail=cloudErrorMessage(error);
+  if(/API Cloudflare non déployée|page HTML|JSON attendu|API invalide/i.test(detail)){
+    return 'API Cloudflare non active. Les routes /api/health, /api/save et /api/load ne répondent pas en JSON.\n\nCause probable : le ZIP a été envoyé par dépôt direct dans le tableau de bord Cloudflare, ce qui n’active pas les Pages Functions. Déployez par GitHub ou par Wrangler.\n\nDétail : '+detail;
+  }
+  return 'Enregistrement en ligne impossible. Vérifiez Internet et les bindings Cloudflare GLOBAL3_KV + GLOBAL3_DB, puis réessayez.\n\nDétail : '+detail;
+}
+function isCloudSyncedResult(j){return !!(j&&(j.success||j.ok)&&j.saved===true&&j.kvSaved===true&&j.d1Saved===true);}
+function showOnlineOnlyScreen(error){
+  const msg=onlineRequiredMessage(error||'Connexion non confirmée');
+  app.innerHTML=`<div class="wrap"><div class="card" style="max-width:720px;margin:80px auto;text-align:center"><h1>GLOBAL 3</h1><h2>API Cloudflare à activer</h2><p style="line-height:1.55">Tous les enregistrements doivent se faire directement en ligne dans Cloudflare KV + D1. Pour cela, les routes API Cloudflare Pages Functions doivent être actives.</p><pre style="white-space:pre-wrap;text-align:left;background:#f8fafc;border:1px solid #e5e7eb;border-radius:12px;padding:14px;color:#334155">${esc(msg)}</pre><button onclick="location.reload()">Réessayer</button></div></div>`;
+}
+async function cloudHealthCheck(){
+  if(!isCloudOnline()) return {ok:false,success:false,offline:true,message:'Internet indisponible'};
+  const r=await fetchWithTimeout(CLOUD_API_BASE+'/health');
+  return await readJsonResponse(r);
+}
+function chooseNewestData(localData,remoteData){
+  const l=localData?Date.parse(localData.__lastModifiedAt||localData.updatedAt||0):0;
+  const r=remoteData?Date.parse(remoteData.__lastModifiedAt||remoteData.updatedAt||0):0;
+  if(remoteData && (!localData || r>=l)) return normalizeData(remoteData);
+  return normalizeData(remoteData||localData||defaultData());
+}
+async function cloudLoadData(){
+  updateCloudSyncBadge('☁️ Chargement KV/D1...');
+  if(!isCloudOnline()) throw new Error('Internet indisponible');
+  await cloudHealthCheck();
+  const r=await fetchWithTimeout(CLOUD_API_BASE+'/load?key='+encodeURIComponent(CLOUD_DATA_KEY));
+  const j=await readJsonResponse(r);
+  const remoteData=j.data?normalizeData(j.data):defaultData();
+  CLOUD_DATA=remoteData;
+  cacheConfirmedCloudData(CLOUD_DATA);
+  CLOUD_LAST_REMOTE_SIGNATURE=stableDataSignature(CLOUD_DATA);
+  updateCloudSyncBadge(j.found?'☁️ Données KV/D1 chargées':'☁️ KV/D1 prêt — nouvelle base');
+  return CLOUD_DATA;
+}
+function saveOnlineBlocking(payload){
+  if(!isCloudOnline()) throw new Error('Internet indisponible');
+  const xhr=new XMLHttpRequest();
+  xhr.open('POST',CLOUD_API_BASE+'/save',false);
+  xhr.setRequestHeader('Content-Type','application/json');
+  xhr.setRequestHeader('X-GLOBAL3-ONLINE-ONLY','1');
+  xhr.send(JSON.stringify({key:CLOUD_DATA_KEY,data:payload,updatedAt:payload.__lastModifiedAt}));
+  let j=null;
+  try{j=xhr.responseText?JSON.parse(xhr.responseText):{};}catch(e){
+      if ((xhr.responseText||'').trim().startsWith('<')) {
+        throw new Error('API Cloudflare non déployée : /api/save renvoie une page HTML. Déployez par GitHub ou Wrangler.');
+      }
+      throw new Error('Réponse API invalide : JSON attendu.');
+    }
+  if(xhr.status<200||xhr.status>=300||!isCloudSyncedResult(j)){
+    throw new Error((j&&j.message)||'Sauvegarde KV/D1 non confirmée');
+  }
+  return j;
+}
+async function cloudSaveNow(d=CLOUD_DATA,opts={}){
+  const payload=normalizeData(Object.assign({},d||CLOUD_DATA||defaultData(),{__lastModifiedAt:new Date().toISOString()}));
+  updateCloudSyncBadge('☁️ Enregistrement KV/D1...');
+  const r=await fetchWithTimeout(CLOUD_API_BASE+'/save',{
+    method:'POST',
+    headers:{'Content-Type':'application/json','X-GLOBAL3-ONLINE-ONLY':'1'},
+    body:JSON.stringify({key:CLOUD_DATA_KEY,data:payload,updatedAt:payload.__lastModifiedAt})
+  });
+  const j=await readJsonResponse(r);
+  if(!isCloudSyncedResult(j)) throw new Error('Sauvegarde KV/D1 non confirmée');
+  cacheConfirmedCloudData(payload);
+  CLOUD_LAST_REMOTE_SIGNATURE=stableDataSignature(payload);
+  updateCloudSyncBadge('☁️ Enregistrement en ligne confirmé');
+  return Object.assign({onlineSaved:true},j);
+}
+async function cloudPullLatest({rerender=false,silent=true}={} ){
+  const before=currentDashboardSection();
+  const data=await cloudLoadData();
+  if(rerender && !isUserEditingForm()){
+    try{renderDash(before.replace(/^sec-/,'')||'home');}catch(e){try{render();}catch(_) {}}
+  }
+  return data;
 }
 function startCloudAutoSync(){
-  if(CLOUD_SYNC_TIMER) clearInterval(CLOUD_SYNC_TIMER);
-  CLOUD_SYNC_TIMER=setInterval(()=>{ if(session()) cloudPullLatest({rerender:true,silent:true}); },12000);
+  // Mode en ligne obligatoire : pas de file locale. Le serveur est la source officielle.
+  window.GLOBAL3_REFRESH_CLOUD=function(){return cloudPullLatest({rerender:true,silent:false});};
 }
-function normalizeData(d){d=d&&typeof d==='object'?d:{}; if(d.data&&typeof d.data==='object') d=d.data; const base=defaultData(); return Object.assign(base,d,{companies:Array.isArray(d.companies)?d.companies:[],users:Array.isArray(d.users)?d.users:base.users,items:Array.isArray(d.items)?d.items:[],sales:Array.isArray(d.sales)?d.sales:[],payments:Array.isArray(d.payments)?d.payments:[],loginAttempts:d.loginAttempts||{}})}
-function cloudLocalCacheKey(){return 'GLOBAL3_CLOUD_CACHE_'+CLOUD_KEY}
-function rememberCloudCache(d){try{localStorage.setItem(cloudLocalCacheKey(),JSON.stringify(d));}catch(e){}}
-function readCloudCache(){try{const raw=localStorage.getItem(cloudLocalCacheKey()); return raw?normalizeData(JSON.parse(raw)):null;}catch(e){return null}}
-async function fetchWithTimeout(url,opts={},ms=6500){const c=new AbortController(); const t=setTimeout(()=>c.abort(),ms); try{return await fetch(url,{...opts,signal:c.signal});}finally{clearTimeout(t);}}
-async function cloudLoadData(){const r=await fetchWithTimeout('/api/load?companyId='+encodeURIComponent(CLOUD_KEY)+'&t='+Date.now(),{cache:'no-store'},6500); if(!r.ok) throw new Error('Chargement cloud temporairement indisponible: '+r.status); const j=await r.json().catch(()=>({})); CLOUD_DATA=normalizeData(j); CLOUD_LAST_REMOTE_SIGNATURE=stableDataSignature(CLOUD_DATA); rememberCloudCache(CLOUD_DATA); return CLOUD_DATA;}
-async function cloudSaveNow(d=CLOUD_DATA){if(!d) return; CLOUD_SAVE_IN_PROGRESS=true; updateCloudSyncBadge('🔄 Synchronisation...'); let payload=normalizeData(d); try{const r0=await fetchWithTimeout('/api/load?companyId='+encodeURIComponent(CLOUD_KEY)+'&t='+Date.now(),{cache:'no-store'},5000); if(r0.ok){const remote=normalizeData(await r0.json().catch(()=>({}))); payload=mergeCloudData(remote,payload);}}catch(e){console.warn('Fusion cloud impossible, sauvegarde locale envoyée',e)} const r=await fetchWithTimeout('/api/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({companyId:CLOUD_KEY,data:payload})},9000); if(!r.ok) throw new Error('Sauvegarde cloud temporairement indisponible: '+r.status); CLOUD_DATA=payload; CLOUD_LAST_REMOTE_SIGNATURE=stableDataSignature(payload); rememberCloudCache(payload); CLOUD_SAVE_IN_PROGRESS=false; updateCloudSyncBadge('🔄 Synchronisé multi-appareils');}
-async function cloudLoadSession(){try{const r=await fetchWithTimeout('/api/session',{cache:'no-store'},4500); if(r.ok){const j=await r.json().catch(()=>({})); CLOUD_SESSION=j.session||null;} else CLOUD_SESSION=null;}catch(e){console.warn('Session cloud non chargée',e); CLOUD_SESSION=null;} return CLOUD_SESSION;}
-async function cloudSetSession(x){CLOUD_SESSION=x||null; try{await fetchWithTimeout('/api/session',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session:CLOUD_SESSION})},5000);}catch(e){console.warn('Session cloud non confirmée',e)}}
-async function cloudClearSession(){CLOUD_SESSION=null; try{await fetchWithTimeout('/api/session',{method:'DELETE'},5000);}catch(e){console.warn('Déconnexion cloud non confirmée',e)}}
-async function cloudStart(){app.innerHTML='<div class="wrap"><div class="card" style="max-width:620px;margin:80px auto;text-align:center"><h1>GLOBAL 3</h1><p>Ouverture de la plateforme...</p></div></div>'; try{await cloudLoadData(); await cloudLoadSession();}catch(e){console.warn('Chargement cloud non bloquant',e); CLOUD_DATA=readCloudCache()||defaultData(); await cloudLoadSession();} try{startCloudAutoSync(); render();}catch(e){console.error(e); app.innerHTML='<div class="wrap"><div class="card"><h1>GLOBAL 3</h1><p>Une erreur a empêché l’ouverture complète de la plateforme.</p><pre>'+esc(e.message||e)+'</pre><button onclick="cloudStart()">Réessayer</button></div></div>';}}
-function seed(){if(!CLOUD_DATA) CLOUD_DATA=readCloudCache()||defaultData(); return CLOUD_DATA}
-function save(d){CLOUD_DATA=normalizeData(Object.assign({},d,{__lastModifiedAt:new Date().toISOString()})); rememberCloudCache(CLOUD_DATA); updateCloudSyncBadge('🔄 Synchronisation...'); clearTimeout(CLOUD_SAVE_TIMER); CLOUD_SAVE_TIMER=setTimeout(()=>cloudSaveNow(CLOUD_DATA).catch(e=>{CLOUD_SAVE_IN_PROGRESS=false; updateCloudSyncBadge('⚠️ Sauvegarde locale'); console.error(e); console.warn('Sauvegarde cloud en attente, nouvelle tentative au prochain changement.')}),400)}
-function session(){return CLOUD_SESSION}
-function setSession(x){cloudSetSession(x)}
+async function cloudLoadSession(){
+  CLOUD_SESSION=readLocalSession();
+  if(!isCloudOnline()) return CLOUD_SESSION;
+  try{
+    const r=await fetchWithTimeout(CLOUD_API_BASE+'/session?key='+encodeURIComponent(CLOUD_SESSION_KEY));
+    const j=await readJsonResponse(r);
+    if(j.session){CLOUD_SESSION=j.session; writeLocalSession(CLOUD_SESSION);}
+  }catch(e){}
+  return CLOUD_SESSION;
+}
+async function cloudSetSession(x){
+  CLOUD_SESSION=x||null;
+  writeLocalSession(CLOUD_SESSION);
+  if(isCloudOnline()){
+    try{await fetchWithTimeout(CLOUD_API_BASE+'/session',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:CLOUD_SESSION_KEY,session:CLOUD_SESSION})},4000);}catch(e){}
+  }
+  return {success:true,session:true};
+}
+async function cloudClearSession(){
+  CLOUD_SESSION=null;
+  writeLocalSession(null);
+  if(isCloudOnline()){
+    try{await fetchWithTimeout(CLOUD_API_BASE+'/session?key='+encodeURIComponent(CLOUD_SESSION_KEY),{method:'DELETE'},4000);}catch(e){}
+  }
+}
+async function cloudStart(){
+  app.innerHTML='<div class="wrap"><div class="card" style="max-width:620px;margin:80px auto;text-align:center"><h1>GLOBAL 3</h1><p>Connexion à Cloudflare KV/D1...</p><small>Mode en ligne obligatoire : les enregistrements sont confirmés directement sur le serveur.</small></div></div>';
+  try{
+    await cloudLoadData();
+    await cloudLoadSession();
+    startCloudAutoSync();
+    render();
+  }catch(e){
+    showOnlineOnlyScreen(e);
+  }
+}
+function seed(){if(!CLOUD_DATA) CLOUD_DATA=readLocalDataOnly(); return CLOUD_DATA}
+function save(d){
+  const previous=CLOUD_DATA;
+  const payload=normalizeData(Object.assign({},d||CLOUD_DATA||defaultData(),{__lastModifiedAt:new Date().toISOString()}));
+  try{
+    CLOUD_SAVE_IN_PROGRESS=true;
+    updateCloudSyncBadge('☁️ Enregistrement KV/D1...');
+    const result=saveOnlineBlocking(payload);
+    cacheConfirmedCloudData(payload);
+    CLOUD_LAST_REMOTE_SIGNATURE=stableDataSignature(payload);
+    updateCloudSyncBadge('☁️ Enregistrement en ligne confirmé');
+    return CLOUD_DATA;
+  }catch(e){
+    CLOUD_DATA=previous||CLOUD_DATA;
+    updateCloudSyncBadge('⚠️ Enregistrement non confirmé');
+    g3ProWarning(onlineRequiredMessage(e),'Enregistrement refusé');
+    throw e;
+  }finally{
+    CLOUD_SAVE_IN_PROGRESS=false;
+  }
+}
+function session(){return CLOUD_SESSION||readLocalSession()}
+function setSession(x){return cloudSetSession(x)}
 function logout(){cloudClearSession().finally(()=>renderLogin())}
 function current(){const d=seed(), s=session(); if(!s) return {d}; if(s.expiresAt && Date.now()>Number(s.expiresAt)){CLOUD_SESSION=null; cloudClearSession(); alert('Session caisse expirée. Veuillez vous reconnecter.'); return {d};} const user=d.users.find(u=>u.id===s.userId&&u.status==='active'); if(user?.role==='caisse' && !isCaisseInAllowedHours(user)){CLOUD_SESSION=null; cloudClearSession(); alert('Accès caisse bloqué : vous êtes hors de la plage horaire autorisée ('+caisseAllowedRangeLabel(user)+').'); return {d};} const company=user?.companyId?d.companies.find(c=>c.id===user.companyId):null; return {d,s,user,company}}
+window.addEventListener('online',function(){updateCloudSyncBadge('☁️ Internet rétabli — vérification KV/D1...'); cloudPullLatest({rerender:false,silent:true}).catch(()=>{});});
+window.addEventListener('offline',function(){updateCloudSyncBadge('⚠️ Hors ligne — enregistrement impossible');});
+document.addEventListener('visibilitychange',function(){if(document.visibilityState==='visible' && isCloudOnline()){cloudPullLatest({rerender:false,silent:true}).catch(()=>{});}});
+
 
 function isDataLocked(){const {company}=current(); return !!company?.dataLocked;}
 function dataLockStatusBox(){
@@ -396,11 +551,12 @@ function openUnlockDataPopup(){
   document.body.insertAdjacentHTML('beforeend',`<div class="g3ProPopupBackdrop" onclick="if(event.target===this)closeG3ProPopup()"><div class="g3ProPopupCard" onclick="event.stopPropagation()"><button class="g3ProPopupClose" onclick="closeG3ProPopup()">×</button><div class="g3ProPopupIcon">🔐</div><h2>Déverrouillage sécurisé</h2><p>Entrez le mot de passe administrateur pour déverrouiller les données de cette entreprise.</p><input id="unlockAdminPass" type="password" class="unlockAdminInput" placeholder="Mot de passe administrateur"><div class="g3ProPopupActions"><button onclick="confirmUnlockCompanyData()">Déverrouiller</button><button class="secondary" onclick="closeG3ProPopup()">Annuler</button></div></div></div>`);
   setTimeout(()=>document.getElementById('unlockAdminPass')?.focus(),80);
 }
-function confirmUnlockCompanyData(){
+async function confirmUnlockCompanyData(){
   const pass=document.getElementById('unlockAdminPass')?.value||'';
   const {d,company,user}=current();
   if(!user || user.role!=='admin') return g3ProWarning('Déverrouillage réservé à l’administrateur de l’entreprise.','Accès refusé');
-  if(String(pass)!==String(user.password||'')) return g3ProWarning('Mot de passe administrateur incorrect. Les données restent verrouillées.','Déverrouillage refusé');
+  if(!(await verifyUserPassword(user,pass))) return g3ProWarning('Mot de passe administrateur incorrect. Les données restent verrouillées.','Déverrouillage refusé');
+  await migratePasswordIfPlain(user,pass,d);
   const c=(d.companies||[]).find(x=>x.id===company.id); if(!c) return;
   c.dataLocked=false; c.dataUnlockedAt=new Date().toISOString(); c.dataUnlockedBy=user?.name||user?.email||'Administrateur';
   save(d); closeG3ProPopup(); renderDash('param');
@@ -459,12 +615,13 @@ function openRestoreBackupPopup(){
   closeG3ProPopup();
   document.body.insertAdjacentHTML('beforeend',`<div class="g3ProPopupBackdrop" onclick="if(event.target===this)closeG3ProPopup()"><div class="g3ProPopupCard restoreBackupCard" onclick="event.stopPropagation()"><button class="g3ProPopupClose" onclick="closeG3ProPopup()">×</button><div class="g3ProPopupIcon">🛡️</div><h2>Restaurer une sauvegarde</h2><p>Choisissez un fichier JSON exporté depuis GLOBAL 3. Une copie interne de sécurité sera créée avant la restauration.</p><label class="restoreFileLabel">Fichier de sauvegarde JSON<input id="restoreBackupFile" type="file" accept="application/json,.json"></label><label class="restoreFileLabel">Mot de passe administrateur<input id="restoreBackupPass" type="password" placeholder="Mot de passe administrateur"></label><div class="g3ProPopupActions"><button onclick="confirmRestoreGlobal3Backup()">Restaurer</button><button class="secondary" onclick="closeG3ProPopup()">Annuler</button></div></div></div>`);
 }
-function confirmRestoreGlobal3Backup(){
-  const {user}=current();
+async function confirmRestoreGlobal3Backup(){
+  const {d,user}=current();
   const pass=document.getElementById('restoreBackupPass')?.value||'';
   const file=document.getElementById('restoreBackupFile')?.files?.[0];
   if(!user || user.role!=='admin') return g3ProWarning('Restauration réservée à l’administrateur de l’entreprise.','Accès refusé');
-  if(String(pass)!==String(user.password||'')) return g3ProWarning('Mot de passe administrateur incorrect. La restauration est annulée.','Restauration refusée');
+  if(!(await verifyUserPassword(user,pass))) return g3ProWarning('Mot de passe administrateur incorrect. La restauration est annulée.','Restauration refusée');
+  await migratePasswordIfPlain(user,pass,d);
   if(!file) return g3ProWarning('Veuillez sélectionner un fichier de sauvegarde JSON avant de restaurer.','Fichier manquant');
   const reader=new FileReader();
   reader.onload=function(){
@@ -477,7 +634,7 @@ function confirmRestoreGlobal3Backup(){
       CLOUD_DATA=normalizeData(restored);
       rememberCloudCache(CLOUD_DATA);
       clearTimeout(CLOUD_SAVE_TIMER);
-      cloudSaveNow(CLOUD_DATA).catch(e=>console.warn('Restauration locale réussie, synchronisation cloud en attente',e));
+      save(CLOUD_DATA);
       closeG3ProPopup();
       g3ProInfo('Sauvegarde restaurée avec succès. Les données de GLOBAL 3 ont été récupérées depuis le fichier JSON.','Restauration réussie');
       setTimeout(()=>render(),200);
@@ -829,7 +986,7 @@ function passwordResetRequestsBox(){
   const rows=(d.passwordResetRequests||[]).filter(r=>r.companyId===company.id && r.role==='caisse').slice().sort((a,b)=>new Date(b.createdAt)-new Date(a.createdAt));
   return `<div class="superTableWrap"><table class="g2table"><tr><th>Date</th><th>Utilisateur</th><th>Profil</th><th>Contact</th><th>Motif</th><th>Statut</th><th>Action</th></tr>${rows.map(r=>`<tr><td>${new Date(r.createdAt).toLocaleString('fr-FR')}</td><td>${esc(r.userName||r.email)}<br><small>${esc(r.email||'')}</small></td><td>${esc(r.role||'')}</td><td>${esc(r.phone||'')}</td><td>${esc(r.reason||'')}</td><td>${esc(r.status||'')}</td><td class="actionCell">${r.status==='pending'?`<button onclick="resetPasswordRequestByAdmin('${r.id}')">Générer mot de passe</button>`:'<span class="saleBadge">traité</span>'}</td></tr>`).join('')||'<tr><td colspan="7">Aucune demande de mot de passe oublié.</td></tr>'}</table></div>`;
 }
-function resetPasswordRequestByAdmin(rid){
+async function resetPasswordRequestByAdmin(rid){
   if(!requireAdmin('Réservé à l’administrateur.')) return;
   const {d,company,user}=current();
   const r=(d.passwordResetRequests||[]).find(x=>x.id===rid&&x.companyId===company.id);
@@ -837,7 +994,7 @@ function resetPasswordRequestByAdmin(rid){
   const u=(d.users||[]).find(x=>x.id===r.userId&&x.companyId===company.id);
   if(!u||u.role!=='caisse') return alert('Compte non autorisé. L’administrateur peut réinitialiser uniquement un compte Caisse.');
   const temp=makeTempPassword();
-  u.password=temp;
+  await setUserPasswordSecure(u,temp);
   u.status='active';
   u.mustChangePassword=true;
   r.status='done'; r.doneAt=new Date().toISOString(); r.doneBy=user?.id||'';
@@ -846,21 +1003,21 @@ function resetPasswordRequestByAdmin(rid){
   alert('Mot de passe temporaire généré pour '+(u.name||u.email)+' :\n\n'+temp+'\n\nL’utilisateur devra le changer à la prochaine connexion.');
   renderDash('param');
 }
-function enforcePasswordChange(u){
+async function enforcePasswordChange(u){
   if(!u?.mustChangePassword) return true;
   const np=prompt('Mot de passe temporaire détecté. Saisissez un nouveau mot de passe personnel :');
-  if(!np || np.length<4){alert('Mot de passe trop court. Connexion annulée.'); return false;}
+  if(!np || np.length<6){alert('Mot de passe trop court. Utilisez au moins 6 caractères. Connexion annulée.'); return false;}
   const d=seed(); const target=(d.users||[]).find(x=>x.id===u.id);
-  if(target){target.password=np; target.mustChangePassword=false; save(d);}
+  if(target){await setUserPasswordSecure(target,np); target.mustChangePassword=false; save(d);}
   alert('Nouveau mot de passe enregistré.');
   return true;
 }
 
-function login(){
+async function login(){
   const d=seed(), email=$('#loginEmail').value.trim().toLowerCase(), pass=$('#loginPass').value, selectedRole=$('#loginRole')?.value||'caisse';
   const existing=d.users.find(x=>String(x.email||'').toLowerCase()===email);
   if(existing && existing.status==='blocked') return alert('Ce compte est bloqué. Contactez l’administrateur.');
-  const u=d.users.find(x=>String(x.email||'').toLowerCase()===email&&x.password===pass&&x.status==='active');
+  const u=(existing && existing.status==='active' && await verifyUserPassword(existing,pass)) ? existing : null;
   if(!u){const r=registerLoginFailure(email); return alert(r.blocked?'Compte bloqué après 05 mauvaises tentatives. Contactez l’administrateur.':'Identifiants incorrects. Tentative '+r.attempts+'/5');}
 
   // Respect strict du profil choisi sur la page de connexion.
@@ -875,14 +1032,27 @@ function login(){
   if(u.role==='caisse' && !isCaisseInAllowedHours(u)){
     return alert('Accès caisse refusé : ce compte est utilisable uniquement de '+caisseAllowedRangeLabel(u)+'. Contactez l’administrateur pour modifier la plage horaire.');
   }
+  await migratePasswordIfPlain(u,pass,d);
   resetLoginAttempts(email);
   if(u.companyId){const c=d.companies.find(x=>x.id===u.companyId), st=statusCompany(c); if(['expired','blocked','suspended'].includes(st)) return renderExpired(c,st)}
-  if(!enforcePasswordChange(u)) return;
-  setSession(sessionPayloadForUser(u));
+  if(!(await enforcePasswordChange(u))) return;
+  await setSession(sessionPayloadForUser(u));
   if(u.role==='caisse') logCaisseAction('Connexion caisse','Session '+caisseSessionMinutes(u)+' min | Horaire autorisé '+caisseAllowedRangeLabel(u));
   render()
 }
-function registerCompany(){const d=seed(), name=$('#cName').value.trim(), legalForm=$('#cLegalForm')?.value.trim()||'', rccm=$('#cRccm')?.value.trim()||'', taxAccount=$('#cTaxAccount')?.value.trim()||'', activity=$('#cActivity')?.value.trim()||'', owner=$('#cOwner').value.trim(), address=$('#cAddress')?.value.trim()||'', phone=$('#cPhone').value.trim(), email=$('#cEmail').value.trim().toLowerCase(), pass=$('#cPass').value||'1234', type=$('#cType').value; if(!name||!email) return alert('Raison sociale et e-mail obligatoires'); if(d.users.some(u=>u.email.toLowerCase()===email)) return alert('Email déjà utilisé'); const cid=id('ent'), uid=id('usr'), start=today(), end=new Date(Date.now()+14*86400000).toISOString().slice(0,10); d.companies.push({id:cid,name,legalForm,rccm,taxAccount,activity,owner,address,phone,email,businessType:type,status:'FREE',planCode:'FREE',plan:'Plan gratuit — FREE',subscriptionStart:start,subscriptionEnd:new Date(Date.now()+30*86400000).toISOString().slice(0,10),createdAt:new Date().toISOString(),notes:'',shopSlug:slugify(name),shopBanner:'Boutique officielle',shopColor:'#024644'}); d.users.push({id:uid,companyId:cid,name:owner||'Administrateur principal',email,password:pass,role:'admin',status:'active',createdAt:new Date().toISOString(),mainAdmin:true}); save(d); setSession({userId:uid}); render()}
+async function registerCompany(){
+  const d=seed(), name=$('#cName').value.trim(), legalForm=$('#cLegalForm')?.value.trim()||'', rccm=$('#cRccm')?.value.trim()||'', taxAccount=$('#cTaxAccount')?.value.trim()||'', activity=$('#cActivity')?.value.trim()||'', owner=$('#cOwner').value.trim(), address=$('#cAddress')?.value.trim()||'', phone=$('#cPhone').value.trim(), email=$('#cEmail').value.trim().toLowerCase(), pass=$('#cPass').value||'1234', type=$('#cType').value;
+  if(!name||!email) return alert('Raison sociale et e-mail obligatoires');
+  if(d.users.some(u=>String(u.email||'').toLowerCase()===email)) return alert('Email déjà utilisé');
+  const cid=id('ent'), uid=id('usr'), start=today();
+  d.companies.push({id:cid,name,legalForm,rccm,taxAccount,activity,owner,address,phone,email,businessType:type,status:'FREE',planCode:'FREE',plan:'Plan gratuit — FREE',subscriptionStart:start,subscriptionEnd:new Date(Date.now()+30*86400000).toISOString().slice(0,10),createdAt:new Date().toISOString(),notes:'',shopSlug:slugify(name),shopBanner:'Boutique officielle',shopColor:'#024644'});
+  const newUser={id:uid,companyId:cid,name:owner||'Administrateur principal',email,role:'admin',status:'active',createdAt:new Date().toISOString(),mainAdmin:true};
+  await setUserPasswordSecure(newUser,pass);
+  d.users.push(newUser);
+  save(d);
+  save(d); await setSession({userId:uid});
+  render();
+}
 function renderExpired(c,st){app.innerHTML=`<div class="wrap"><div class="card" style="max-width:720px;margin:80px auto;text-align:center"><div class="brand">GLOBAL 3</div><h1>Abonnement ${esc(st)}</h1><p class="sub">L’accès de l’entreprise <b>${esc(c?.name)}</b> est actuellement ${esc(st)}. Contactez MEGA SERVICES DIABO pour renouveler ou réactiver l’abonnement.</p><p><b>+225 0777041790</b><br>megaservicediabo@gmail.com</p><button onclick="logout()">Retour connexion</button></div></div>`}
 function render(){if(location.hash.startsWith('#boutique-global')) return renderGlobalShop(); if(location.hash.startsWith('#boutique/')) return renderPublicShop(location.hash.split('/')[1]||''); const {user,company}=current(); if(!user) return renderLogin(); if(user.role==='superadmin') return renderSuper(); const st=statusCompany(company); if(['expired','blocked','suspended'].includes(st)) return renderExpired(company,st); renderDash('home')}
 
@@ -971,13 +1141,13 @@ function showAccountUsersPage(){
   </div></section>`,'account');
 }
 function saveCompanyInfo(){if(!requireAdmin()) return;const {d,company}=current(); const c=d.companies.find(x=>x.id===company.id); if(!c) return; c.name=$('#accName')?.value.trim()||c.name; c.legalForm=$('#accLegalForm')?.value.trim()||''; c.rccm=$('#accRccm')?.value.trim()||''; c.taxAccount=$('#accTaxAccount')?.value.trim()||''; c.activity=$('#accActivity')?.value.trim()||''; c.owner=$('#accOwner')?.value.trim()||''; c.address=$('#accAddress')?.value.trim()||''; c.phone=$('#accPhone')?.value.trim()||''; c.email=$('#accEmail')?.value.trim()||''; c.businessType=$('#accType')?.value||c.businessType; save(d); alert('Informations de l’entreprise mises à jour.'); showAccountPage();}
-function accountUsersTable(users,admin,currentUserId){return `<div class="superTableWrap"><table class="g2table accountUsersTable"><tr><th>Nom</th><th>Email</th><th>Mot de passe</th><th>Rôle</th><th>Début caisse</th><th>Fin caisse</th><th>Statut</th><th>Action</th></tr>${users.map(u=>{const isCaisse=u.role==='caisse'; return `<tr><td><input id="auName_${u.id}" value="${esc(u.name||'')}" ${admin?'':'disabled'}></td><td><input id="auEmail_${u.id}" value="${esc(u.email||'')}" ${admin?'':'disabled'}></td><td><input id="auPass_${u.id}" value="${esc(u.password||'')}" ${admin?'':'disabled'}></td><td><select id="auRole_${u.id}" onchange="toggleRowCaisseHours('${u.id}')" ${admin?'':'disabled'}><option value="admin" ${u.role==='admin'?'selected':''}>Admin</option><option value="caisse" ${u.role==='caisse'?'selected':''}>Caisse</option></select></td><td class="caisseOnlyCell" id="auStartCell_${u.id}">${isCaisse?`<input id="auStart_${u.id}" type="time" value="${esc(caisseStartTime(u))}" ${admin?'':'disabled'}>`:''}</td><td class="caisseOnlyCell" id="auEndCell_${u.id}">${isCaisse?`<input id="auEnd_${u.id}" type="time" value="${esc(caisseEndTime(u))}" ${admin?'':'disabled'}>`:''}</td><td><select id="auStatus_${u.id}" ${admin?'':'disabled'}><option value="active" ${(u.status||'active')==='active'?'selected':''}>Actif</option><option value="blocked" ${u.status==='blocked'?'selected':''}>Bloqué</option></select></td><td class="actionCell">${admin?`<div class="rowActions"><button class="btn2" onclick="saveAccountUser('${u.id}')">Enregistrer</button>${u.id!==currentUserId?`<button class="danger" onclick="deleteAccountUser('${u.id}')">Supprimer</button>`:''}</div>`:'-'}</td></tr>`}).join('')||'<tr><td colspan="8">Aucun utilisateur enregistré.</td></tr>'}</table></div>`}
+function accountUsersTable(users,admin,currentUserId){return `<div class="superTableWrap"><table class="g2table accountUsersTable"><tr><th>Nom</th><th>Email</th><th>Mot de passe</th><th>Rôle</th><th>Début caisse</th><th>Fin caisse</th><th>Statut</th><th>Action</th></tr>${users.map(u=>{const isCaisse=u.role==='caisse'; return `<tr><td><input id="auName_${u.id}" value="${esc(u.name||'')}" ${admin?'':'disabled'}></td><td><input id="auEmail_${u.id}" value="${esc(u.email||'')}" ${admin?'':'disabled'}></td><td><input id="auPass_${u.id}" value="" placeholder="${passwordFieldPlaceholder(u)||'Nouveau mot de passe'}" ${admin?'':'disabled'}></td><td><select id="auRole_${u.id}" onchange="toggleRowCaisseHours('${u.id}')" ${admin?'':'disabled'}><option value="admin" ${u.role==='admin'?'selected':''}>Admin</option><option value="caisse" ${u.role==='caisse'?'selected':''}>Caisse</option></select></td><td class="caisseOnlyCell" id="auStartCell_${u.id}">${isCaisse?`<input id="auStart_${u.id}" type="time" value="${esc(caisseStartTime(u))}" ${admin?'':'disabled'}>`:''}</td><td class="caisseOnlyCell" id="auEndCell_${u.id}">${isCaisse?`<input id="auEnd_${u.id}" type="time" value="${esc(caisseEndTime(u))}" ${admin?'':'disabled'}>`:''}</td><td><select id="auStatus_${u.id}" ${admin?'':'disabled'}><option value="active" ${(u.status||'active')==='active'?'selected':''}>Actif</option><option value="blocked" ${u.status==='blocked'?'selected':''}>Bloqué</option></select></td><td class="actionCell">${admin?`<div class="rowActions"><button class="btn2" onclick="saveAccountUser('${u.id}')">Enregistrer</button>${u.id!==currentUserId?`<button class="danger" onclick="deleteAccountUser('${u.id}')">Supprimer</button>`:''}</div>`:'-'}</td></tr>`}).join('')||'<tr><td colspan="8">Aucun utilisateur enregistré.</td></tr>'}</table></div>`}
 
 function toggleNewCaisseHours(prefix){const roleId=prefix==='acc'?'accNewRole':'uRole'; const role=$('#'+roleId)?.value||'caisse'; document.querySelectorAll('.'+prefix+'CaisseOnly').forEach(el=>{el.style.display=role==='caisse'?'':'none';});}
 function toggleRowCaisseHours(uid){const role=$(`#auRole_${uid}`)?.value||'caisse'; const startCell=$(`#auStartCell_${uid}`), endCell=$(`#auEndCell_${uid}`); if(!startCell||!endCell) return; if(role==='caisse'){if(!startCell.querySelector('input')) startCell.innerHTML=`<input id="auStart_${uid}" type="time" value="07:00">`; if(!endCell.querySelector('input')) endCell.innerHTML=`<input id="auEnd_${uid}" type="time" value="22:00">`;}else{startCell.innerHTML=''; endCell.innerHTML='';}}
-function saveAccountUser(uid){if(!requireAdmin()) return;const {d,company}=current(); const u=d.users.find(x=>x.id===uid&&x.companyId===company.id); if(!u) return alert('Utilisateur introuvable'); const email=$(`#auEmail_${uid}`)?.value.trim().toLowerCase()||''; if(!email) return alert('Email obligatoire'); if(d.users.some(x=>x.id!==uid&&x.email.toLowerCase()===email)) return alert('Cet email est déjà utilisé'); u.name=$(`#auName_${uid}`)?.value.trim()||u.name; u.email=email; u.password=$(`#auPass_${uid}`)?.value||u.password; u.role=$(`#auRole_${uid}`)?.value||u.role; u.sessionMinutes=0; u.caisseStartTime=u.role==='caisse'?normalizeHour($(`#auStart_${uid}`)?.value,'07:00'):''; u.caisseEndTime=u.role==='caisse'?normalizeHour($(`#auEnd_${uid}`)?.value,'22:00'):''; u.status=$(`#auStatus_${uid}`)?.value||'active'; save(d); alert('Utilisateur modifié.'); showAccountUsersPage();}
+async function saveAccountUser(uid){if(!requireAdmin()) return;const {d,company}=current(); const u=d.users.find(x=>x.id===uid&&x.companyId===company.id); if(!u) return alert('Utilisateur introuvable'); const email=$(`#auEmail_${uid}`)?.value.trim().toLowerCase()||''; if(!email) return alert('Email obligatoire'); if(d.users.some(x=>x.id!==uid&&String(x.email||'').toLowerCase()===email)) return alert('Cet email est déjà utilisé'); u.name=$(`#auName_${uid}`)?.value.trim()||u.name; u.email=email; const newPass=$(`#auPass_${uid}`)?.value||''; if(newPass){await setUserPasswordSecure(u,newPass); u.mustChangePassword=true;} u.role=$(`#auRole_${uid}`)?.value||u.role; u.sessionMinutes=0; u.caisseStartTime=u.role==='caisse'?normalizeHour($(`#auStart_${uid}`)?.value,'07:00'):''; u.caisseEndTime=u.role==='caisse'?normalizeHour($(`#auEnd_${uid}`)?.value,'22:00'):''; u.status=$(`#auStatus_${uid}`)?.value||'active'; save(d); alert('Utilisateur modifié.'); showAccountUsersPage();}
 function deleteAccountUser(uid){if(!requireAdmin()) return;const {d,company}=current(); const us=d.users.filter(u=>u.companyId===company.id); if(us.length<=1) return alert('Impossible de supprimer le dernier utilisateur du compte.'); if(!confirm('Supprimer définitivement cet utilisateur et son accès ?')) return; d.users=d.users.filter(u=>u.id!==uid); save(d); showAccountUsersPage();}
-function addAccountUser(){if(!requireAdmin()) return;const {d,company}=current(); if(!assertPlanFeature(company,'multi_users','Le multi-utilisateur est réservé aux plans BUSINESS et BUSINESS PLUS.')) return; if(!canCreateMoreUsers(company,d)) return alert('Limite utilisateurs atteinte pour le plan '+planDef(company).statut+' : '+userLimitLabel(company)+' utilisateur(s).'); const name=$('#accNewName')?.value.trim()||'', email=$('#accNewEmail')?.value.trim().toLowerCase()||'', pass=$('#accNewPass')?.value||'1234', role=$('#accNewRole')?.value||'caisse'; if(!name||!email) return alert('Nom et email obligatoires'); if(d.users.some(u=>u.email.toLowerCase()===email)) return alert('Email déjà utilisé'); d.users.push({id:id('usr'),companyId:company.id,name,email,password:pass,role,status:'active',sessionMinutes:0,caisseStartTime:role==='caisse'?normalizeHour($('#accNewStart')?.value,'07:00'):'',caisseEndTime:role==='caisse'?normalizeHour($('#accNewEnd')?.value,'22:00'):'',createdAt:new Date().toISOString()}); save(d); showAccountUsersPage();}
+async function addAccountUser(){if(!requireAdmin()) return;const {d,company}=current(); if(!assertPlanFeature(company,'multi_users','Le multi-utilisateur est réservé aux plans BUSINESS et BUSINESS PLUS.')) return; if(!canCreateMoreUsers(company,d)) return alert('Limite utilisateurs atteinte pour le plan '+planDef(company).statut+' : '+userLimitLabel(company)+' utilisateur(s).'); const name=$('#accNewName')?.value.trim()||'', email=$('#accNewEmail')?.value.trim().toLowerCase()||'', pass=$('#accNewPass')?.value||'1234', role=$('#accNewRole')?.value||'caisse'; if(!name||!email) return alert('Nom et email obligatoires'); if(d.users.some(u=>String(u.email||'').toLowerCase()===email)) return alert('Email déjà utilisé'); const u={id:id('usr'),companyId:company.id,name,email,role,status:'active',sessionMinutes:0,caisseStartTime:role==='caisse'?normalizeHour($('#accNewStart')?.value,'07:00'):'',caisseEndTime:role==='caisse'?normalizeHour($('#accNewEnd')?.value,'22:00'):'',createdAt:new Date().toISOString(),mustChangePassword:true}; await setUserPasswordSecure(u,pass); d.users.push(u); save(d); showAccountUsersPage();}
 
 function quickCard(label,icon,target,cls){return `<button class="quickCard ${cls||''}" onclick="show('${target}')"><span>${icon}</span><b>${label}</b></button>`}
 function renderDash(sec='home'){
@@ -1138,7 +1308,7 @@ function openStockDetailsPopup(iid){
   const {d,company}=current(); const i=(d.items||[]).find(x=>x.id===iid&&x.companyId===company.id); if(!i) return;
   const boutique=isBoutiqueItem(i), qty=Number(i.stock||0), buy=Number(i.buy||0), sell=Number(i.sell||0), stockVal=boutique?qty*buy:0, saleVal=boutique?qty*sell:sell, profit=Math.max(0,saleVal-stockVal);
   document.querySelector('.stockModalBackdrop')?.remove();
-  const html=`<div class="stockModalBackdrop" onclick="if(event.target===this)closeStockPopup()"><div class="stockModalCard stockDetailsModal" onclick="event.stopPropagation()"><button class="stockModalClose" onclick="closeStockPopup()">×</button><div class="stockModalHead"><h2>Détails du produit ou service</h2><p>Informations complètes, valeurs et historique.</p></div><div class="stockDetailsGrid"><div class="stockDetailPhoto">${i.photo?`<img src="${esc(i.photo)}" alt="${esc(i.name||'')}">`:'📦'}</div><div class="stockDetailList"><p><b>Code :</b> ${esc(i.code||'-')}</p><p><b>Nom :</b> ${esc(i.name||'-')}</p><p><b>Catégorie :</b> ${esc(i.cat||'-')}</p><p><b>Description :</b> ${esc(i.marketplaceDesc||i.detail||'-')}</p><p><b>Quantité :</b> ${boutique?qty:'Service'}</p><p><b>Prix d’achat :</b> ${boutique?money(buy):'-'}</p><p><b>Prix de vente :</b> ${money(sell)}</p><p><b>Valeur du stock :</b> ${boutique?money(stockVal):'-'}</p><p><b>Bénéfice potentiel :</b> ${money(profit)}</p></div></div><div class="stockMovementBox stockMovementEntry"><h3 class="stockHistoryGoldTitle">Historique des entrées</h3>${stockHistoryHtml(i,'approvisionnement')}</div><div class="stockMovementBox stockMovementExit"><h3 class="stockHistoryGoldTitle">Historique des sorties</h3>${stockHistoryHtml(i,'retrait')}</div><div class="stockModalActions"><button class="btn2" onclick="editItem('${i.id}')">Modifier</button><button class="darkBtn" onclick="closeStockPopup()">Fermer</button></div></div></div>`;
+  const html=`<div class="stockModalBackdrop" onclick="if(event.target===this)closeStockPopup()"><div class="stockModalCard stockDetailsModal" onclick="event.stopPropagation()"><button class="stockModalClose" onclick="closeStockPopup()">×</button><div class="stockModalHead"><h2>Détails du produit ou service</h2><p>Informations complètes, valeurs et historique.</p></div><div class="stockDetailsGrid"><div class="stockDetailPhoto">${i.photo?`<img src="${esc(i.photo)}" alt="${esc(i.name||'')}">`:'📦'}</div><div class="stockDetailList"><p><b>Code :</b> ${esc(i.code||'-')}</p><p><b>Nom :</b> ${esc(i.name||'-')}</p><p><b>Catégorie :</b> ${esc(i.cat||'-')}</p><p><b>Description :</b> ${esc(i.marketplaceDesc||i.detail||'-')}</p><p><b>Quantité :</b> ${boutique?qty:'Service'}</p><p><b>Prix d’achat :</b> ${boutique?money(buy):'-'}</p><p><b>Prix de vente :</b> ${money(sell)}</p><p><b>Valeur du stock :</b> ${boutique?money(stockVal):'-'}</p><p><b>Bénéfice potentiel :</b> ${money(profit)}</p></div></div><div class="stockMovementBox"><h3>Historique des entrées</h3>${stockHistoryHtml(i,'approvisionnement')}</div><div class="stockMovementBox"><h3>Historique des sorties</h3>${stockHistoryHtml(i,'retrait')}</div><div class="stockModalActions"><button class="btn2" onclick="editItem('${i.id}')">Modifier</button><button class="darkBtn" onclick="closeStockPopup()">Fermer</button></div></div></div>`;
   document.body.insertAdjacentHTML('beforeend',html);
 }
 function openStockDeletePopup(iid){
@@ -1669,7 +1839,7 @@ html,body{margin:0;padding:0;background:#fff;font-family:Arial,Helvetica,sans-se
 .stockTable td:nth-child(2){font-weight:900}
 .stockTable td:nth-child(4),.stockTable td:nth-child(5),.stockTable td:nth-child(6),.stockTable td:nth-child(7),.stockTable td:nth-child(8){text-align:center}
 .stockFooterWave{position:absolute;left:0;right:0;bottom:0;height:9mm;border-top:.8mm solid #d49b08;background:#004a48;border-top-left-radius:70% 9mm}
-.stockTotalRow td{background:#fff2b8!important;color:#001f1e!important;font-weight:1000!important;border-top:.45mm solid #d49b08!important;text-align:center!important}.stockTotalRow td:first-child{text-align:right!important}.emptyCell{color:#777;text-align:center;padding:8mm!important}.stockMeta{font-size:2.5mm;text-align:right;color:#555;margin-top:2mm}
+.emptyCell{color:#777;text-align:center;padding:8mm!important}.stockMeta{font-size:2.5mm;text-align:right;color:#555;margin-top:2mm}
 @media print{.printToolbar{display:none!important}body{background:#fff!important}.stockA4{margin:0!important;width:210mm!important;min-height:297mm!important;box-shadow:none!important}.stockCatStrip{height:auto!important;min-height:15mm!important;overflow:visible!important}.stockFooterWave{position:fixed}}
 `;}
 function stockA4HTML(company,items,categoryTitle){
@@ -1677,26 +1847,8 @@ function stockA4HTML(company,items,categoryTitle){
   const type=(company.businessType||'').toUpperCase();
   const cats=[...new Set((items||[]).map(i=>String(i.cat||'').trim()).filter(Boolean))];
   const catText=categoryTitle ? categoryTitle : (cats.length ? cats.join(' / ') + ' /' : 'Aucune catégorie enregistrée');
-  const list=(items||[]);
-  const totals=list.reduce((acc,i)=>{
-    const boutique=isBoutiqueItem(i);
-    const qty=(boutique && String(i.stockType||'limited')!=='unlimited')?Number(i.stock||0):0;
-    const buy=Number(i.buy||0);
-    const sell=Number(i.sell||0);
-    acc.count+=1;
-    acc.qty+=qty;
-    if(boutique){
-      acc.buyValue+=qty*buy;
-      acc.sellValue+=qty*sell;
-    }else{
-      acc.serviceValue+=sell;
-    }
-    return acc;
-  },{count:0,qty:0,buyValue:0,sellValue:0,serviceValue:0});
-  const totalSellValue=totals.sellValue+totals.serviceValue;
-  const rows=list.map(i=>{const boutique=isBoutiqueItem(i);return `<tr><td>${esc(i.code||'')}</td><td>${esc(i.name||'')}</td><td>${esc(i.cat||'')}</td><td>${boutique?'Produit':'Service'}</td><td>${boutique?(i.stockType==='unlimited'?'Illimité':Number(i.stock||0)):'-'}</td><td>${boutique?money(i.buy):'-'}</td><td>${money(i.sell)}</td><td>${boutique?autoBoutiqueChargePercent(i):Number(i.charge||0)}%</td></tr>`}).join('') || '<tr><td colspan="8" class="emptyCell">Aucun produit ou service enregistré.</td></tr>';
-  const totalRow=list.length?`<tr class="stockTotalRow"><td colspan="4">TOTAL GÉNÉRAL</td><td>${Number(totals.qty||0)}</td><td>${money(totals.buyValue||0)}</td><td>${money(totalSellValue||0)}</td><td>${totals.count} élément${totals.count>1?'s':''}</td></tr>`:'';
-  return `<div class="stockA4">${pdfStandardHeaderHTML(company)}<div class="stockTopLine"></div><div class="stockTitle"><h1>LISTE DES CATÉGORIES</h1></div><div class="stockGoldLine"></div><div class="stockCatStrip"><span class="stockCatLine">${esc(catText)}</span></div><div class="stockSubTitle"><h2>${categoryTitle?'ÉTAT DU STOCK — CATÉGORIE : '+esc(categoryTitle):'ÉTAT DU STOCK — LISTE DES PRODUITS ET SERVICES'}</h2></div><div class="stockGoldLine"></div><table class="stockTable"><colgroup><col style="width:13%"><col style="width:16%"><col style="width:15%"><col style="width:12%"><col style="width:9%"><col style="width:12%"><col style="width:13%"><col style="width:10%"></colgroup><thead><tr><th>Code</th><th>Élément</th><th>Catégorie</th><th>Type</th><th>Qté</th><th>Achat U.</th><th>Vente / Prix</th><th>Charges %</th></tr></thead><tbody>${rows}${totalRow}</tbody></table><div class="stockMeta">Document généré par GLOBAL 3 — MEGA SERVICES DIABO</div><div class="stockFooterWave"></div></div>`;
+  const rows=(items||[]).map(i=>{const boutique=isBoutiqueItem(i);return `<tr><td>${esc(i.code||'')}</td><td>${esc(i.name||'')}</td><td>${esc(i.cat||'')}</td><td>${boutique?'Produit':'Service'}</td><td>${boutique?(i.stockType==='unlimited'?'Illimité':Number(i.stock||0)):'-'}</td><td>${boutique?money(i.buy):'-'}</td><td>${money(i.sell)}</td><td>${boutique?autoBoutiqueChargePercent(i):Number(i.charge||0)}%</td></tr>`}).join('') || '<tr><td colspan="8" class="emptyCell">Aucun produit ou service enregistré.</td></tr>';
+  return `<div class="stockA4">${pdfStandardHeaderHTML(company)}<div class="stockTopLine"></div><div class="stockTitle"><h1>LISTE DES CATÉGORIES</h1></div><div class="stockGoldLine"></div><div class="stockCatStrip"><span class="stockCatLine">${esc(catText)}</span></div><div class="stockSubTitle"><h2>${categoryTitle?'ÉTAT DU STOCK — CATÉGORIE : '+esc(categoryTitle):'ÉTAT DU STOCK — LISTE DES PRODUITS ET SERVICES'}</h2></div><div class="stockGoldLine"></div><table class="stockTable"><colgroup><col style="width:13%"><col style="width:16%"><col style="width:15%"><col style="width:12%"><col style="width:9%"><col style="width:12%"><col style="width:13%"><col style="width:10%"></colgroup><thead><tr><th>Code</th><th>Élément</th><th>Catégorie</th><th>Type</th><th>Qté</th><th>Achat U.</th><th>Vente / Prix</th><th>Charges %</th></tr></thead><tbody>${rows}</tbody></table><div class="stockMeta">Document généré par GLOBAL 3 — MEGA SERVICES DIABO</div><div class="stockFooterWave"></div></div>`;
 }
 function standaloneStockHTML(company,items,categoryTitle){
   return '<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>'+esc(categoryTitle?'Stock - '+categoryTitle:'État du stock')+'</title><style>'+stockPrintStyles()+'</style></head><body><div class="printToolbar"><button onclick="window.print()">Imprimer / PDF</button><button onclick="window.close()">Fermer</button></div>'+stockA4HTML(company,items,categoryTitle)+'<script>setTimeout(function(){window.focus();},200);</script></body></html>';
@@ -2349,8 +2501,6 @@ function previewStockPhoto(input){const file=input?.files?.[0]; const prev=$('#p
 function setStockPhotoPreview(src){const prev=$('#pPhotoPreview'), hidden=$('#pPhotoData'); if(hidden) hidden.value=src||''; if(prev){ if(src){prev.classList.remove('stockPhotoEmpty','hidden'); prev.innerHTML=`<img src="${src}" alt="Photo actuelle"><div><strong>Photo actuelle</strong><small>Visible dans la boutique client.</small></div>`;} else {prev.classList.remove('hidden'); prev.classList.add('stockPhotoEmpty'); prev.innerHTML='<span class="photoIcon">📷</span><strong>Aucune photo</strong><small>Photo visible par les clients dans la boutique publique.</small>';}}}
 function removeStockPhoto(){const hidden=$('#pPhotoData'); if(hidden) hidden.value=''; const pf=$('#pPhoto'); if(pf) pf.value=''; const rm=$('#pRemovePhoto'); if(rm) rm.checked=true; setStockPhotoPreview('');}
 async function addItem(){if(!requireAdmin('La caisse ne peut pas gérer les stocks.')) return;if(!ensureDataUnlocked('l’enregistrement du produit ou service')) return;if(!ensureActiveExerciseEditable()) return;const {d,company}=current(), cid=company.id; const eid=$('#pEdit')?.value; const existing=eid?(d.items||[]).find(i=>i.id===eid&&i.companyId===cid):null; const cat=$('#pCat')?.value||''; if(!cat) return alert('Sélectionnez ou créez une catégorie.'); const selectedKind=$('#pCat')?.selectedOptions?.[0]?.dataset?.kind||categoryKind(cat); const isService=selectedKind==='service'||($('#pType')?.value==='service'); const servicePrice=+($('#pServicePrice')?.value||0); const buy=isService?0:(+$('#pBuy')?.value||0), sell=isService?servicePrice:(+($('#pSell')?.value||0)); const charge=isService?(+($('#pCharge')?.value||0)):autoBoutiqueChargePercent({buy,sell}); const removePhoto=!!$('#pRemovePhoto')?.checked; const photoData=$('#pPhotoData')?.value||''; const photo=removePhoto?'':(photoData||existing?.photo||''); const detail=($('#pDetail')?.value||'').trim(); const obj={companyId:cid,code:eid?($('#pCode')?.value||uniqueItemCode(d,cid,eid)):uniqueItemCode(d,cid),name:$('#pName').value,cat:cat,detail,marketplaceDesc:detail,buy,sell,stockType:isService?'none':($('#pStockType')?.value||'limited'),stock:isService?0:(($('#pStockType')?.value||'limited')==='unlimited'?0:(+$('#pStock')?.value||0)),alert:isService?0:(+$('#pAlert')?.value||5),charge,type:isService?'service':'boutique',photo}; if(!obj.name) return alert('Nom obligatoire'); if(!eid && planCode(company)==='FREE'){const itemCount=(d.items||[]).filter(i=>i.companyId===cid).length; const cats=new Set((d.items||[]).filter(i=>i.companyId===cid).map(i=>i.cat).filter(Boolean)); if(!cats.has(cat) && cats.size>=1) return alert('Plan FREE : 1 seule catégorie produits OU services est autorisée.'); if(itemCount>=5) return alert('Plan FREE : maximum 5 produits OU 5 services.');} if(d.items.some(i=>i.companyId===cid&&i.id!==eid&&String(i.code||'').toUpperCase()===String(obj.code||'').toUpperCase())) obj.code=uniqueItemCode(d,cid,eid); if(eid){const it=d.items.find(i=>i.id===eid&&i.companyId===cid); if(it){const before=Number(it.stock||0); Object.assign(it,obj); it.movements=it.movements||[]; it.movements.push({date:new Date().toLocaleDateString('fr-FR'),type:'modification',before,qty:Number(it.stock||0)-before,after:Number(it.stock||0),responsable:activeUserName(),note:'Modification de la fiche'})}}else{const newItem=Object.assign({id:id('itm'),movements:[]},obj); newItem.movements.push({date:new Date().toLocaleDateString('fr-FR'),type:'création',before:0,qty:Number(newItem.stock||0),after:Number(newItem.stock||0),responsable:activeUserName(),note:'Création de la fiche'}); d.items.push(newItem)} save(d); closeStockPopup(); renderDash('stocks')}
-function editItem(iid){openStockItemPopup(iid)}
-function deleteItem(iid){openStockDeletePopup(iid)}
 function clearItemForm(){['pEdit','pName','pDetail','pBuy','pSell','pServicePrice','pStock','pAlert','pCharge','pPhotoData'].forEach(k=>{const el=$('#'+k); if(el) el.value=(k==='pAlert'?5:k==='pStock'?0:k==='pCharge'?30:'')}); const pc=$('#pCat'); if(pc) pc.value=''; const pst=$('#pStockType'); if(pst)pst.value='limited'; setStockPhotoPreview(''); const pf=$('#pPhoto'); if(pf) pf.value=''; const rm=$('#pRemovePhoto'); if(rm) rm.checked=false; toggleChargeField(); const {d,company}=current(); const c=$('#pCode'); if(c)c.value=uniqueItemCode(d,company.id)}
 function toggleChargeField(){const cat=$('#pCat')?.value||''; const selectedKind=$('#pCat')?.selectedOptions?.[0]?.dataset?.kind||categoryKind(cat); const hasCat=!!cat; const isService=hasCat&&(selectedKind==='service'); const form=document.querySelector('.stockFormReorg'); if(form){form.classList.toggle('serviceMode',!!isService); form.classList.toggle('productMode',hasCat&&!isService);} document.querySelectorAll('.itemField').forEach(el=>{el.style.display=hasCat?'flex':'none'}); const price=$('#servicePriceField'); if(price) price.style.display=(hasCat&&isService)?'flex':'none'; document.querySelectorAll('.stockTypeOnly').forEach(el=>{el.style.display=(hasCat&&!isService)?'flex':'none'}); document.querySelectorAll('.stockOnly').forEach(el=>{el.style.display=(hasCat&&!isService)?'flex':'none'}); const pt=$('#pType'); if(pt) pt.value=hasCat?(isService?'service':'boutique'):''; toggleStockQuantityField(); updateAutoProductCharge()}
 function toggleStockQuantityField(){const st=$('#pStockType')?.value||'limited'; document.querySelectorAll('.stockQtyOnly').forEach(el=>{el.style.display=st==='limited'?'flex':'none'}); const stock=$('#pStock'); if(stock && st==='unlimited') stock.value=0;}
@@ -2443,20 +2593,20 @@ function addSale(){
   const code=$('#saleCodeInput'); if(code)code.value=''; const list=$('#saleServiceSelect'); if(list)list.value='';
   resetSaleSelection(); refreshSaleCodeSuggestions(); if($('#saleServiceLookup')?.value==='list') populateSaleItemList();
 }
-function resetUserPasswordDirect(uid){
+async function resetUserPasswordDirect(uid){
   if(!requireAdmin('Réservé à l’administrateur.')) return;
   const {d,company}=current();
   const u=(d.users||[]).find(x=>x.id===uid&&x.companyId===company.id);
   if(!u||u.role!=='caisse') return alert('Réinitialisation refusée : un administrateur d’entreprise peut réinitialiser uniquement un compte Caisse. Pour un compte Administrateur, contactez le Super Admin GLOBAL3.');
   if(!confirm('Réinitialiser le mot de passe de '+(u.name||u.email)+' ?')) return;
   const temp=makeTempPassword();
-  u.password=temp; u.status='active'; u.mustChangePassword=true;
+  await setUserPasswordSecure(u,temp); u.status='active'; u.mustChangePassword=true;
   resetLoginAttempts(u.email);
   save(d);
   alert('Nouveau mot de passe temporaire :\n\n'+temp+'\n\nÀ communiquer à l’utilisateur. Il devra le changer à la prochaine connexion.');
   renderDash('param');
 }
-function addUser(){if(!requireAdmin('La caisse ne peut pas créer ni voir les mots de passe des utilisateurs.')) return;const {d,company}=current(); if(!assertPlanFeature(company,'multi_users','Le multi-utilisateur est réservé aux plans BUSINESS et BUSINESS PLUS.')) return; if(!canCreateMoreUsers(company,d)) return alert('Limite utilisateurs atteinte pour le plan '+planDef(company).statut+' : '+userLimitLabel(company)+' utilisateur(s).'); const email=$('#uEmail').value.trim().toLowerCase(); if(d.users.some(u=>u.companyId===company.id&&u.email===email)) return alert('Email déjà utilisé'); d.users.push({id:id('usr'),companyId:company.id,name:$('#uName').value,email,password:$('#uPass').value||'1234',role:$('#uRole').value,status:'active',sessionMinutes:0,caisseStartTime:$('#uRole').value==='caisse'?normalizeHour($('#uStart')?.value,'07:00'):'',caisseEndTime:$('#uRole').value==='caisse'?normalizeHour($('#uEnd')?.value,'22:00'):'',createdAt:new Date().toISOString()}); save(d); renderDash('param')}
+async function addUser(){if(!requireAdmin('La caisse ne peut pas créer ni voir les mots de passe des utilisateurs.')) return;const {d,company}=current(); if(!assertPlanFeature(company,'multi_users','Le multi-utilisateur est réservé aux plans BUSINESS et BUSINESS PLUS.')) return; if(!canCreateMoreUsers(company,d)) return alert('Limite utilisateurs atteinte pour le plan '+planDef(company).statut+' : '+userLimitLabel(company)+' utilisateur(s).'); const email=$('#uEmail').value.trim().toLowerCase(); if(d.users.some(u=>u.companyId===company.id&&String(u.email||'').toLowerCase()===email)) return alert('Email déjà utilisé'); const u={id:id('usr'),companyId:company.id,name:$('#uName').value,email,role:$('#uRole').value,status:'active',sessionMinutes:0,caisseStartTime:$('#uRole').value==='caisse'?normalizeHour($('#uStart')?.value,'07:00'):'',caisseEndTime:$('#uRole').value==='caisse'?normalizeHour($('#uEnd')?.value,'22:00'):'',createdAt:new Date().toISOString(),mustChangePassword:true}; await setUserPasswordSecure(u,$('#uPass').value||'1234'); d.users.push(u); save(d); renderDash('param')}
 function blockUser(uid){const d=seed(), u=d.users.find(x=>x.id===uid); if(u)u.status='blocked'; save(d); renderDash('param')}
 
 function superPasswordResetRequestsBox(){
@@ -2464,7 +2614,7 @@ function superPasswordResetRequestsBox(){
   const rows=(d.passwordResetRequests||[]).filter(r=>r.role==='admin').slice().sort((a,b)=>new Date(b.createdAt)-new Date(a.createdAt));
   return `<div class="superTableWrap"><table class="superTable"><thead><tr><th>Date</th><th>Entreprise</th><th>Administrateur</th><th>Contact</th><th>Motif</th><th>Statut</th><th>Action</th></tr></thead><tbody>${rows.map(r=>{const c=(d.companies||[]).find(x=>x.id===r.companyId); return `<tr><td>${new Date(r.createdAt).toLocaleString('fr-FR')}</td><td>${esc(c?.name||'-')}</td><td><b>${esc(r.userName||r.email)}</b><br><small>${esc(r.email||'')}</small></td><td>${esc(r.phone||'')}</td><td>${esc(r.reason||'')}</td><td>${esc(r.status||'')}</td><td>${r.status==='pending'?`<button class="detailsBtn" onclick="resetPasswordRequestBySuper('${r.id}')">Générer mot de passe</button>`:'<span class="statusPill active">traité</span>'}</td></tr>`}).join('')||'<tr><td colspan="7">Aucune demande administrateur en attente.</td></tr>'}</tbody></table></div>`;
 }
-function resetPasswordRequestBySuper(rid){
+async function resetPasswordRequestBySuper(rid){
   const {d,user}=current();
   if(user?.role!=='superadmin') return alert('Réservé au Super Admin GLOBAL3.');
   const r=(d.passwordResetRequests||[]).find(x=>x.id===rid && x.role==='admin');
@@ -2472,21 +2622,21 @@ function resetPasswordRequestBySuper(rid){
   const u=(d.users||[]).find(x=>x.id===r.userId && x.role==='admin');
   if(!u) return alert('Compte administrateur introuvable.');
   const temp=makeTempPassword();
-  u.password=temp; u.status='active'; u.mustChangePassword=true;
+  await setUserPasswordSecure(u,temp); u.status='active'; u.mustChangePassword=true;
   r.status='done'; r.doneAt=new Date().toISOString(); r.doneBy=user.id;
   resetLoginAttempts(u.email);
   save(d);
   alert('Mot de passe temporaire généré pour l’administrateur '+(u.name||u.email)+' :\n\n'+temp+'\n\nL’administrateur devra le changer à la prochaine connexion.');
   renderSuper();
 }
-function superResetAdminPassword(uid){
+async function superResetAdminPassword(uid){
   const {d,user}=current();
   if(user?.role!=='superadmin') return alert('Réservé au Super Admin GLOBAL3.');
   const u=(d.users||[]).find(x=>x.id===uid && x.role==='admin');
   if(!u) return alert('Compte administrateur introuvable.');
   if(!confirm('Générer un mot de passe temporaire pour cet administrateur ?')) return;
   const temp=makeTempPassword();
-  u.password=temp; u.status='active'; u.mustChangePassword=true;
+  await setUserPasswordSecure(u,temp); u.status='active'; u.mustChangePassword=true;
   resetLoginAttempts(u.email);
   save(d);
   alert('Mot de passe temporaire généré pour '+(u.name||u.email)+' :\n\n'+temp+'\n\nChangement obligatoire à la prochaine connexion.');
@@ -3007,19 +3157,21 @@ function openClientLoginPopup(companyId){
   const html=`<div class="marketPayModalBackdrop" id="clientLoginModal"><div class="marketPayModal clientAuthModal"><button class="marketPayClose" onclick="document.getElementById('clientLoginModal')?.remove()">×</button><h2>Connexion espace client</h2><label>Téléphone<input id="clientLoginPhone" placeholder="Téléphone"></label><label>Mot de passe<input id="clientLoginPass" type="password" placeholder="Mot de passe"></label><div class="marketPayActions"><button onclick="loginPublicClient('${companyId}')">Ouvrir mon espace</button><button class="btn2" onclick="document.getElementById('clientLoginModal')?.remove();openClientRegisterPopup('${companyId}')">Inscription</button></div></div></div>`;
   document.body.insertAdjacentHTML('beforeend',html);
 }
-function savePublicClientRegister(companyId){
+async function savePublicClientRegister(companyId){
   const d=seed(); d.marketClients=d.marketClients||[];
   const name=($('#clientRegName')?.value||'').trim(), phone=($('#clientRegPhone')?.value||'').trim(), email=($('#clientRegEmail')?.value||'').trim(), pass=($('#clientRegPass')?.value||'').trim();
   if(!name||!phone||!pass) return alert('Nom, téléphone et mot de passe obligatoires.');
   if(d.marketClients.some(c=>c.companyId===companyId&&c.phone===phone)) return alert('Ce téléphone est déjà inscrit. Connectez-vous à votre espace client.');
-  const client={id:id('clt'),companyId,name,phone,email,password:pass,createdAt:new Date().toISOString()};
+  const client={id:id('clt'),companyId,name,phone,email,createdAt:new Date().toISOString()};
+  await setUserPasswordSecure(client,pass);
   d.marketClients.push(client); save(d); window.publicShopClientId=client.id;
   document.getElementById('clientRegisterModal')?.remove(); alert('Inscription réussie. Votre espace client est créé.'); renderPublicShop((d.companies||[]).find(c=>c.id===companyId)?.shopSlug||'');
 }
-function loginPublicClient(companyId){
+async function loginPublicClient(companyId){
   const d=seed(); const phone=($('#clientLoginPhone')?.value||'').trim(), pass=($('#clientLoginPass')?.value||'').trim();
-  const client=(d.marketClients||[]).find(c=>c.companyId===companyId&&c.phone===phone&&c.password===pass);
-  if(!client) return alert('Téléphone ou mot de passe incorrect.');
+  const client=(d.marketClients||[]).find(c=>c.companyId===companyId&&c.phone===phone);
+  if(!client || !(await verifyUserPassword(client,pass))) return alert('Téléphone ou mot de passe incorrect.');
+  await migratePasswordIfPlain(client,pass,d);
   window.publicShopClientId=client.id; document.getElementById('clientLoginModal')?.remove(); openClientSpace(companyId);
 }
 function openClientSpace(companyId){
@@ -3103,7 +3255,7 @@ function deleteMarketplaceOrder(orderId,isAdmin){
     }
   }
   save(d);
-  cloudSaveNow(CLOUD_DATA).catch(e=>console.error('Sauvegarde immédiate suppression commande',e));
+  save(CLOUD_DATA);
   document.getElementById('marketOrderDetailsModal')?.remove();
   if(isAdmin) showMarketplacePage(); else { document.getElementById('clientSpaceModal')?.remove(); openClientSpace(o.companyId); }
 }

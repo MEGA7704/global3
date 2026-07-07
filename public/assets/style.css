@@ -2872,16 +2872,3 @@ img,svg,canvas,video{max-width:100%;height:auto}.modalCard{max-height:92vh;overf
 .obligationPeriodGrid{display:grid;grid-template-columns:auto minmax(170px,1fr) minmax(190px,1fr) auto;gap:12px;align-items:end}.obligationPeriodGrid label{display:flex;flex-direction:column;gap:6px;font-size:13px;font-weight:900;color:#0b3f3d}.obligationPeriodGrid input,.obligationPeriodGrid select{height:46px;border:1px solid #dfb735;border-radius:13px;background:#fff;color:#092d2b;padding:0 12px;font-weight:900;outline:none}.obligationPeriodGrid button{min-height:46px;white-space:nowrap}
 @media(max-width:900px){.obligationPeriodGrid{grid-template-columns:1fr 1fr}.obligationPeriodGrid button{width:100%}}
 @media(max-width:560px){.obligationPeriodGrid{grid-template-columns:1fr}.obligationPeriodTitle{align-items:flex-start}.obligationPeriodTitle span{width:100%;text-align:center}.obligationPeriodGrid input,.obligationPeriodGrid select{width:100%}}
-
-
-/* Correctif V9 : couleurs titres historiques stock + ligne total PDF catégories */
-.stockMovementBox h3.stockHistoryGoldTitle,
-.stockMovementEntry h3,
-.stockMovementExit h3{
-  color:#d99000!important;
-  background:linear-gradient(90deg,#fff7df,#ffffff)!important;
-  border-left:5px solid #d99000!important;
-  padding:9px 12px!important;
-  border-radius:12px!important;
-  font-weight:1000!important;
-}

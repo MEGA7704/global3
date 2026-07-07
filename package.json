@@ -1,13 +1,14 @@
 {
-  "name": "global3-cloudflare-pages",
+  "name": "global3-cloudflare-pages-kv-d1-complet",
   "version": "1.0.0",
   "private": true,
-  "description": "GLOBAL 3 prêt pour GitHub et Cloudflare Pages avec API Functions KV/D1.",
+  "type": "module",
+  "description": "GLOBAL 3 - Cloudflare Pages complet avec Pages Functions, KV et D1",
   "scripts": {
-    "build": "node -e \"console.log('Projet statique : dossier de sortie public/')\"",
-    "check": "node --check public/assets/app.js && node --check functions/api/load.js && node --check functions/api/save.js && node --check functions/api/session.js && node --check functions/api/health.js",
-    "dev": "wrangler pages dev public --functions functions",
-    "deploy": "wrangler pages deploy public --project-name global3-cloud-backup"
+    "check": "node --check public/assets/app.js && node --check functions/_utils.js && node --check functions/api/health.js && node --check functions/api/load.js && node --check functions/api/save.js && node --check functions/api/session.js",
+    "dev": "wrangler pages dev public --compatibility-date=2026-07-07",
+    "deploy": "wrangler pages deploy public --project-name global3-saas-kv-d1 --branch production",
+    "d1:init": "wrangler d1 execute global3-db --file=./migrations/0001_global3_schema.sql --remote"
   },
   "devDependencies": {
     "wrangler": "latest"

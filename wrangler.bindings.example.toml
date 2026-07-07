@@ -1,0 +1,15 @@
+name = "global3-saas-kv-d1"
+compatibility_date = "2026-07-07"
+pages_build_output_dir = "public"
+
+# Copiez ce fichier vers wrangler.toml seulement si vous déployez avec Wrangler
+# et remplacez les IDs par vos vrais IDs Cloudflare.
+
+[[kv_namespaces]]
+binding = "GLOBAL3_KV"
+id = "REMPLACER_PAR_ID_DU_NAMESPACE_KV"
+
+[[d1_databases]]
+binding = "GLOBAL3_DB"
+database_name = "global3-db"
+database_id = "REMPLACER_PAR_ID_DE_LA_BASE_D1"

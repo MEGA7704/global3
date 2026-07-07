@@ -1,56 +1,55 @@
-const responseHeaders = {
-  'Content-Type': 'application/json; charset=utf-8',
-  'Cache-Control': 'no-store'
-};
+import { chooseNewest, bindingStatus, ensureD1Schema, json, parseJsonSafe, safeKey, DATA_KEY_DEFAULT } from '../_utils.js';
 
-function jsonObject(obj = {}) {
-  return new Response(JSON.stringify(obj), { headers: responseHeaders });
-}
+export async function onRequestGet({ request, env }) {
+  const url = new URL(request.url);
+  const key = safeKey(url.searchParams.get('key'), DATA_KEY_DEFAULT);
+  const status = bindingStatus(env);
 
-function rawJson(data) {
-  return new Response(data || '{}', { headers: responseHeaders });
-}
-
-async function ensureDB(env) {
-  if (!env.DB) return false;
-  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS backups (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    company_id TEXT NOT NULL,
-    data TEXT NOT NULL,
-    created_at TEXT NOT NULL
-  )`).run();
-  return true;
-}
-
-export async function onRequestOptions() {
-  return new Response(null, { status: 204, headers: responseHeaders });
-}
-
-export async function onRequestGet(context) {
-  const url = new URL(context.request.url);
-  const companyId = String(url.searchParams.get('companyId') || 'global3_all').trim() || 'global3_all';
-  const errors = [];
-
-  if (context.env.GLOBAL3_KV) {
-    try {
-      const kvData = await context.env.GLOBAL3_KV.get('company:' + companyId);
-      if (kvData) return rawJson(kvData);
-    } catch (error) {
-      errors.push('KV: ' + (error?.message || String(error)));
-    }
+  if (!status.kv || !status.d1) {
+    return json({
+      success: false,
+      ok: false,
+      key,
+      data: null,
+      found: false,
+      bindings: status,
+      message: 'Chargement en ligne impossible : GLOBAL3_KV et GLOBAL3_DB sont obligatoires.'
+    }, 503);
   }
 
-  if (context.env.DB) {
-    try {
-      await ensureDB(context.env);
-      const last = await context.env.DB.prepare(
-        'SELECT data FROM backups WHERE company_id = ? ORDER BY id DESC LIMIT 1'
-      ).bind(companyId).first();
-      if (last?.data) return rawJson(last.data);
-    } catch (error) {
-      errors.push('D1: ' + (error?.message || String(error)));
-    }
+  await ensureD1Schema(env.GLOBAL3_DB);
+
+  const rawKv = await env.GLOBAL3_KV.get(key);
+  const kvData = parseJsonSafe(rawKv);
+  const row = await env.GLOBAL3_DB.prepare('SELECT value FROM global3_data WHERE key = ?1').bind(key).first();
+  const d1Data = parseJsonSafe(row && row.value);
+  const data = chooseNewest(kvData, d1Data);
+  const sources = [];
+  if (kvData) sources.push('KV');
+  if (d1Data) sources.push('D1');
+
+  // Réparation automatique si une source est vide mais l'autre possède les données.
+  if (data && !kvData) {
+    await env.GLOBAL3_KV.put(key, JSON.stringify(data), { metadata: { repairedAt: new Date().toISOString(), source: 'repair-from-d1' } });
+  }
+  if (data && !d1Data) {
+    const updatedAt = String(data.__lastModifiedAt || new Date().toISOString());
+    await env.GLOBAL3_DB.prepare(`INSERT INTO global3_data(key, value, updated_at, source)
+      VALUES (?1, ?2, ?3, 'repair-from-kv')
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at, source = 'repair-from-kv'`)
+      .bind(key, JSON.stringify(data), updatedAt)
+      .run();
   }
 
-  return jsonObject(errors.length ? { _cloudErrors: errors } : {});
+  return json({
+    success: true,
+    ok: true,
+    key,
+    data,
+    found: !!data,
+    source: sources.join('+') || 'none',
+    bindings: status,
+    onlineOnly: true,
+    message: data ? 'Données en ligne chargées depuis KV/D1.' : 'KV + D1 prêts. Aucune donnée existante.'
+  });
 }
