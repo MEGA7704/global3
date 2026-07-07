@@ -1,6 +1,7 @@
 'use strict';
 const $=s=>document.querySelector(s); const app=$('#app');
-const K='GLOBAL3_DATA_V2', S='GLOBAL3_SESSION_V2';
+const G3_PERIOD_FILTERS=Object.create(null);
+const G3_CONTRACT_PERIOD_FILTERS=Object.create(null);
 const id=p=>p+'_'+Date.now().toString(36)+'_'+Math.random().toString(36).slice(2,7);
 const today=()=>new Date().toISOString().slice(0,10);
 const randomPart=(len=8)=>{const chars='ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; let out=''; for(let i=0;i<len;i++) out+=chars[Math.floor(Math.random()*chars.length)]; return out};
@@ -330,7 +331,7 @@ function passwordFieldPlaceholder(u){return u?.passwordHash?'••••••�
 // Règle métier : aucun enregistrement n'est validé uniquement en local.
 // 1) Chargement depuis Cloudflare KV/D1 au démarrage ;
 // 2) Sauvegarde directe et confirmée par /api/save ;
-// 3) Cache navigateur seulement après confirmation en ligne.
+// 3) Aucune sauvegarde navigateur : la source officielle est uniquement KV + D1.
 // ================================================================
 const CLOUD_KEY='global3_all';
 let CLOUD_DATA=null;
@@ -344,24 +345,17 @@ const CLOUD_TIMEOUT_MS=12000;
 function defaultData(){return {companies:[],users:[{id:'super',companyId:null,name:'MEGA SERVICES DIABO',email:'mega@services.local',passwordHash:'sha256$G3_DEFAULT_SUPERADMIN_2026$6a8e54d650efaa5902cc6d5e9be24bce19060ee29d8e892d7eb23b76262a41b1',role:'superadmin',status:'active',mustChangePassword:true,createdAt:new Date().toISOString()}],items:[],sales:[],payments:[],loginAttempts:{}}}
 function stableDataSignature(d){try{return JSON.stringify(d||{});}catch(e){return String(Date.now())}}
 function normalizeData(d){d=d&&typeof d==='object'?d:{}; if(d.data&&typeof d.data==='object') d=d.data; const base=defaultData(); const out=Object.assign({},base,d,{companies:Array.isArray(d.companies)?d.companies:[],users:Array.isArray(d.users)?d.users:base.users,items:Array.isArray(d.items)?d.items:[],sales:Array.isArray(d.sales)?d.sales:[],payments:Array.isArray(d.payments)?d.payments:[],loginAttempts:d.loginAttempts||{}}); if(!out.users.some(u=>u.id==='super'||u.role==='superadmin')) out.users.unshift(base.users[0]); return out;}
-function localMainDataKey(){return K}
-function localSessionKey(){return S}
-function readJsonLocal(key){try{const raw=localStorage.getItem(key); return raw?JSON.parse(raw):null;}catch(e){return null}}
-function writeJsonLocal(key,value){try{localStorage.setItem(key,JSON.stringify(value)); return true;}catch(e){console.warn('Cache navigateur impossible:',e); return false}}
-function removeJsonLocal(key){try{localStorage.removeItem(key);}catch(e){}}
-function readLocalDataOnly(){return normalizeData(readJsonLocal(localMainDataKey())||defaultData())}
 function cacheConfirmedCloudData(d){
   const payload=normalizeData(Object.assign({},d||{}, {__lastModifiedAt:(d&&d.__lastModifiedAt)||new Date().toISOString()}));
   CLOUD_DATA=payload;
-  writeJsonLocal(localMainDataKey(),payload);
   return payload;
 }
 function updateCloudSyncBadge(txt){const el=document.getElementById('syncBadge'); if(el) el.textContent=txt||'☁️ En ligne KV/D1';}
 function currentDashboardSection(){return document.querySelector('.section.active')?.id || 'home'}
 function isUserEditingForm(){const a=document.activeElement; return !!(a && ['INPUT','TEXTAREA','SELECT'].includes(a.tagName));}
 function isCloudOnline(){try{return typeof navigator==='undefined' || navigator.onLine!==false;}catch(e){return true}}
-function writeLocalSession(x){try{x?localStorage.setItem(localSessionKey(),JSON.stringify(x)):localStorage.removeItem(localSessionKey());}catch(e){}}
-function readLocalSession(){try{const raw=localStorage.getItem(localSessionKey()); return raw?JSON.parse(raw):null;}catch(e){return null}}
+function setMemorySession(x){CLOUD_SESSION=x||null; return CLOUD_SESSION;}
+function getMemorySession(){return CLOUD_SESSION||null;}
 async function fetchWithTimeout(url,opts={},ms=CLOUD_TIMEOUT_MS){
   const ctrl=new AbortController();
   const t=setTimeout(()=>ctrl.abort(),ms);
@@ -464,26 +458,24 @@ function startCloudAutoSync(){
   window.GLOBAL3_REFRESH_CLOUD=function(){return cloudPullLatest({rerender:true,silent:false});};
 }
 async function cloudLoadSession(){
-  CLOUD_SESSION=readLocalSession();
-  if(!isCloudOnline()) return CLOUD_SESSION;
+  setMemorySession(null);
+  if(!isCloudOnline()) return getMemorySession();
   try{
     const r=await fetchWithTimeout(CLOUD_API_BASE+'/session?key='+encodeURIComponent(CLOUD_SESSION_KEY));
     const j=await readJsonResponse(r);
-    if(j.session){CLOUD_SESSION=j.session; writeLocalSession(CLOUD_SESSION);}
+    if(j.session) setMemorySession(j.session);
   }catch(e){}
-  return CLOUD_SESSION;
+  return getMemorySession();
 }
 async function cloudSetSession(x){
-  CLOUD_SESSION=x||null;
-  writeLocalSession(CLOUD_SESSION);
+  setMemorySession(x||null);
   if(isCloudOnline()){
-    try{await fetchWithTimeout(CLOUD_API_BASE+'/session',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:CLOUD_SESSION_KEY,session:CLOUD_SESSION})},4000);}catch(e){}
+    try{await fetchWithTimeout(CLOUD_API_BASE+'/session',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:CLOUD_SESSION_KEY,session:getMemorySession()})},4000);}catch(e){}
   }
   return {success:true,session:true};
 }
 async function cloudClearSession(){
-  CLOUD_SESSION=null;
-  writeLocalSession(null);
+  setMemorySession(null);
   if(isCloudOnline()){
     try{await fetchWithTimeout(CLOUD_API_BASE+'/session?key='+encodeURIComponent(CLOUD_SESSION_KEY),{method:'DELETE'},4000);}catch(e){}
   }
@@ -499,7 +491,7 @@ async function cloudStart(){
     showOnlineOnlyScreen(e);
   }
 }
-function seed(){if(!CLOUD_DATA) CLOUD_DATA=readLocalDataOnly(); return CLOUD_DATA}
+function seed(){if(!CLOUD_DATA) CLOUD_DATA=defaultData(); return CLOUD_DATA}
 function save(d){
   const previous=CLOUD_DATA;
   const payload=normalizeData(Object.assign({},d||CLOUD_DATA||defaultData(),{__lastModifiedAt:new Date().toISOString()}));
@@ -520,7 +512,7 @@ function save(d){
     CLOUD_SAVE_IN_PROGRESS=false;
   }
 }
-function session(){return CLOUD_SESSION||readLocalSession()}
+function session(){return getMemorySession()}
 function setSession(x){return cloudSetSession(x)}
 function logout(){cloudClearSession().finally(()=>renderLogin())}
 function current(){const d=seed(), s=session(); if(!s) return {d}; if(s.expiresAt && Date.now()>Number(s.expiresAt)){CLOUD_SESSION=null; cloudClearSession(); alert('Session caisse expirée. Veuillez vous reconnecter.'); return {d};} const user=d.users.find(u=>u.id===s.userId&&u.status==='active'); if(user?.role==='caisse' && !isCaisseInAllowedHours(user)){CLOUD_SESSION=null; cloudClearSession(); alert('Accès caisse bloqué : vous êtes hors de la plage horaire autorisée ('+caisseAllowedRangeLabel(user)+').'); return {d};} const company=user?.companyId?d.companies.find(c=>c.id===user.companyId):null; return {d,s,user,company}}
@@ -577,16 +569,6 @@ function safeBackupFilename(company){
   const stamp=new Date().toISOString().replace(/[-:]/g,'').replace(/\.\d+Z$/,'').replace('T','-');
   return `backup-global3-${clean}-${stamp}.json`;
 }
-function collectGlobal3LocalStorage(){
-  const out={};
-  try{
-    for(let i=0;i<localStorage.length;i++){
-      const k=localStorage.key(i);
-      if(k && /^GLOBAL3/i.test(k)) out[k]=localStorage.getItem(k);
-    }
-  }catch(e){}
-  return out;
-}
 function exportGlobal3Backup(){
   if(!requireAdmin('Seul un administrateur peut sauvegarder les données.')) return;
   const {d,company,user}=current();
@@ -598,9 +580,10 @@ function exportGlobal3Backup(){
     createdBy:user?.name||user?.email||'Administrateur',
     companyId:company?.id||'',
     companyName:company?.name||'',
-    note:'Sauvegarde complète exportée depuis GLOBAL 3 avant correction ou maintenance.',
-    data:deepCloneDataForBackup(normalizeData(d)),
-    localStorage:collectGlobal3LocalStorage()
+    note:'Sauvegarde complète exportée depuis GLOBAL 3 avant correction ou maintenance. Stockage officiel en ligne KV + D1.',
+    onlineOnly:true,
+    storage:'Cloudflare KV + D1',
+    data:deepCloneDataForBackup(normalizeData(d))
   };
   const blob=new Blob([JSON.stringify(payload,null,2)],{type:'application/json;charset=utf-8'});
   const url=URL.createObjectURL(blob);
@@ -629,11 +612,7 @@ async function confirmRestoreGlobal3Backup(){
       const parsed=JSON.parse(String(reader.result||'{}'));
       const restored=parsed.data && (parsed.type==='GLOBAL3_BACKUP_JSON' || parsed.app) ? parsed.data : parsed;
       if(!restored || !Array.isArray(restored.companies) || !Array.isArray(restored.users)) throw new Error('Format invalide');
-      const before=deepCloneDataForBackup(seed());
-      try{localStorage.setItem('GLOBAL3_RESTORE_POINT_BEFORE_IMPORT',JSON.stringify({createdAt:new Date().toISOString(),data:before}));}catch(e){}
       CLOUD_DATA=normalizeData(restored);
-      rememberCloudCache(CLOUD_DATA);
-      clearTimeout(CLOUD_SAVE_TIMER);
       save(CLOUD_DATA);
       closeG3ProPopup();
       g3ProInfo('Sauvegarde restaurée avec succès. Les données de GLOBAL 3 ont été récupérées depuis le fichier JSON.','Restauration réussie');
@@ -2806,14 +2785,14 @@ function getCompanyReportSales(sales){
   return sales.slice().sort((a,b)=>new Date(b.date||0)-new Date(a.date||0));
 }
 function periodFilterKey(scope){const {company}=current(); return 'GLOBAL3_PERIOD_FILTER_'+String(company?.id||'global')+'_'+String(scope||'report');}
-function getPeriodFilter(scope){try{return JSON.parse(localStorage.getItem(periodFilterKey(scope))||'{}')||{};}catch(e){return {};}}
-function savePeriodFilter(scope,obj){try{localStorage.setItem(periodFilterKey(scope),JSON.stringify(obj||{}));}catch(e){}}
+function getPeriodFilter(scope){return G3_PERIOD_FILTERS[periodFilterKey(scope)]||{};}
+function savePeriodFilter(scope,obj){G3_PERIOD_FILTERS[periodFilterKey(scope)]=Object.assign({},obj||{});}
 function periodFilterRenderTarget(scope){
   if(scope==='contracts') return 'contrats';
   if(scope==='bilan') return 'bilan';
   return 'rapports';
 }
-function resetPeriodFilter(scope){try{localStorage.removeItem(periodFilterKey(scope));}catch(e){} const target=periodFilterRenderTarget(scope); target==='bilan'?showBilan():renderDash(target);}
+function resetPeriodFilter(scope){delete G3_PERIOD_FILTERS[periodFilterKey(scope)]; const target=periodFilterRenderTarget(scope); target==='bilan'?showBilan():renderDash(target);}
 function applyPeriodFilter(scope){
   const now=new Date();
   const type=document.getElementById(scope+'FilterType')?.value||'';
@@ -2879,9 +2858,9 @@ function periodFilterControls(scope){
 }
 function applyPeriodFilterDebounced(scope){clearTimeout(window.__g3PeriodTimer); window.__g3PeriodTimer=setTimeout(()=>applyPeriodFilter(scope),350);}
 function contractPeriodFilterKey(scope){const {company}=current(); return 'GLOBAL3_CONTRACT_PERIOD_FILTER_'+String(company?.id||'global')+'_'+String(scope||'contracts');}
-function getContractPeriodFilter(scope){try{return JSON.parse(localStorage.getItem(contractPeriodFilterKey(scope))||'{}')||{};}catch(e){return {};}}
-function saveContractPeriodFilter(scope,obj){try{localStorage.setItem(contractPeriodFilterKey(scope),JSON.stringify(obj||{}));}catch(e){}}
-function resetContractPeriodFilter(scope){try{localStorage.removeItem(contractPeriodFilterKey(scope));}catch(e){} renderDash('contrats')}
+function getContractPeriodFilter(scope){return G3_CONTRACT_PERIOD_FILTERS[contractPeriodFilterKey(scope)]||{};}
+function saveContractPeriodFilter(scope,obj){G3_CONTRACT_PERIOD_FILTERS[contractPeriodFilterKey(scope)]=Object.assign({},obj||{});}
+function resetContractPeriodFilter(scope){delete G3_CONTRACT_PERIOD_FILTERS[contractPeriodFilterKey(scope)]; renderDash('contrats')}
 function updateContractPeriodInputs(scope){
   const type=document.getElementById(scope+'ContractFilterType')?.value||'';
   ['day','month','year'].forEach(k=>{const el=document.getElementById(scope+'ContractFilterField_'+k); if(el) el.classList.toggle('active', k===type);});
