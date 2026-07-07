@@ -159,7 +159,7 @@ function getInvoiceGroupSales(d,company,sale){
   if(!sale) return [];
   const gid=sale.invoiceGroupId||sale.invoiceId||'';
   if(gid){
-    return (d.sales||[]).filter(x=>x.companyId===company.id && (x.invoiceGroupId===gid || x.invoiceId===gid)).sort((a,b)=>new Date(a.date)-new Date(b.date));
+    return (d.sales||[]).filter(x=>saleBelongsToCompany(x,company.id) && (x.invoiceGroupId===gid || x.invoiceId===gid)).sort((a,b)=>new Date(a.date)-new Date(b.date));
   }
   return [sale];
 }
@@ -659,6 +659,32 @@ function saleBelongsToCompany(s,cid){
 function companySalesRows(d,cid){
   return (Array.isArray(d?.sales)?d.sales:[]).filter(s=>saleBelongsToCompany(s,cid));
 }
+function ensureSaleCompanyId(s,cid){
+  if(s && !s.companyId && saleBelongsToCompany(s,cid)){
+    s.companyId=cid;
+    s.companyIdRepairedAt=s.companyIdRepairedAt||new Date().toISOString();
+    return true;
+  }
+  return false;
+}
+function normalizeCompanySalesOwnership(d,cid){
+  if(!d || !Array.isArray(d.sales)) return false;
+  let changed=false;
+  d.sales.forEach(s=>{ if(ensureSaleCompanyId(s,cid)) changed=true; });
+  return changed;
+}
+function findCompanySaleById(d,cid,sid){
+  const sale=(Array.isArray(d?.sales)?d.sales:[]).find(s=>saleBelongsToCompany(s,cid) && String(s.id||'')===String(sid||''));
+  if(sale) ensureSaleCompanyId(sale,cid);
+  return sale||null;
+}
+function removeCompanySalesByIds(d,cid,ids){
+  if(!d || !Array.isArray(d.sales)) return 0;
+  const set=new Set((Array.isArray(ids)?ids:[ids]).map(x=>String(x||'')).filter(Boolean));
+  const before=d.sales.length;
+  d.sales=d.sales.filter(s=>!(saleBelongsToCompany(s,cid) && set.has(String(s.id||''))));
+  return before-d.sales.length;
+}
 function caisseSessionMinutes(u){return Math.max(5,Number(u?.sessionMinutes||60));}
 function normalizeHour(v,def){v=String(v||def||'').trim(); return /^([01]\d|2[0-3]):[0-5]\d$/.test(v)?v:def;}
 function caisseStartTime(u){return normalizeHour(u?.caisseStartTime||u?.workStart,'07:00')}
@@ -1153,7 +1179,9 @@ function quickCard(label,icon,target,cls){return `<button class="quickCard ${cls
 function renderDash(sec='home'){
   const {d,user,company}=current(), cid=company.id;
   d.items=Array.isArray(d.items)?d.items:[]; d.sales=Array.isArray(d.sales)?d.sales:[];
-  if(syncMarketplaceValidatedOrdersToReport(d,cid)) save(d);
+  const fixedLegacySales=normalizeCompanySalesOwnership(d,cid);
+  const fixedMarketplaceSales=syncMarketplaceValidatedOrdersToReport(d,cid);
+  if(fixedLegacySales||fixedMarketplaceSales) save(d);
   const items=d.items.filter(i=>i.companyId===cid), sales=companySalesRows(d,cid), users=(d.users||[]).filter(u=>u.companyId===cid), clients=(d.clients||[]).filter(c=>c.companyId===cid), obligations=getObligations(d,cid);
   const manageYear=getManageYear(), activeMonth=getActiveMonth();
   var admin=user && user.role==='admin';
@@ -1539,13 +1567,14 @@ function refreshPosTicket(){
 }
 function removeSaleFromTicket(sid){
   const {d,company}=current();
-  const s=(d.sales||[]).find(x=>x.companyId===company.id&&x.id===sid);
+  const s=findCompanySaleById(d,company.id,sid);
   if(!s) return showAutoNotice('Ligne introuvable.','error');
   if(!requireCaisseCanEditSale(s)) return;
   if(isSaleExerciseLocked(s)) return showAutoNotice('Cet exercice est verrouillé. Retrait impossible.','error');
   restoreStockFromSaleRecord(d,s);
-  d.sales=(d.sales||[]).filter(x=>!(x.companyId===company.id&&x.id===sid));
+  removeCompanySalesByIds(d,company.id,sid);
   rebuildMarketplaceOrderReportState(d,s?.marketplaceOrderId);
+  markMarketplaceReportDeletedIfEmpty(d,s?.marketplaceOrderId);
   save(d);
   logCaisseAction('Retrait du ticket','Ligne '+sid+' retirée');
   refreshPosTicket();
@@ -1644,7 +1673,7 @@ function toggleSaleSelection(scope,checked){
 function getSelectedSaleRecords(scope){
   const ids=selectedSaleIds(scope);
   const {d,company}=current();
-  return ids.map(id=>(d.sales||[]).find(s=>s.companyId===company.id&&s.id===id)).filter(Boolean);
+  return ids.map(id=>findCompanySaleById(d,company.id,id)).filter(Boolean);
 }
 function printSelectedSalesInvoice(scope){
   const {d,company}=current();
@@ -1668,19 +1697,19 @@ function deleteSelectedSales(scope){
   const ids=selectedSaleIds(scope);
   if(!ids.length) return g3ProWarning('Veuillez sélectionner au moins une vente à supprimer.','Aucune vente à supprimer');
   const {d,company}=current();
-  const rows=(d.sales||[]).filter(s=>s.companyId===company.id && ids.includes(s.id));
+  const rows=(d.sales||[]).filter(s=>saleBelongsToCompany(s,company.id) && ids.includes(s.id));
   if(scope==='report' && !requireAdmin('La caisse ne peut pas supprimer une vente dans l’historique général.')) return;
   if(rows.some(isSaleExerciseLocked)) return alert('Une ou plusieurs ventes appartiennent à un exercice verrouillé ou clôturé. Suppression impossible.');
   if(!confirm('Supprimer les '+rows.length+' vente(s) sélectionnée(s) ? Le stock des produits sera recalculé automatiquement.')) return;
   rows.forEach(s=>restoreStockFromSaleRecord(d,s));
-  d.sales=(d.sales||[]).filter(s=>!(s.companyId===company.id && ids.includes(s.id)));
-  rows.forEach(s=>rebuildMarketplaceOrderReportState(d,s.marketplaceOrderId));
+  removeCompanySalesByIds(d,company.id,ids);
+  rows.forEach(s=>{rebuildMarketplaceOrderReportState(d,s.marketplaceOrderId); markMarketplaceReportDeletedIfEmpty(d,s.marketplaceOrderId);});
   save(d);
   renderDash(scope==='report'?'rapports':'panier');
 }
 function openEditCartLine(sid){
   const {d,company}=current();
-  const s=(d.sales||[]).find(x=>x.companyId===company.id&&x.id===sid);
+  const s=findCompanySaleById(d,company.id,sid);
   if(!s) return alert('Ligne introuvable');
   if(!requireCaisseCanEditSale(s)) return;
   const isService=Number(s.serviceFee||0)>0 || !s.itemCode;
@@ -1698,7 +1727,7 @@ function updateCartEditTotal(){
 }
 function saveEditCartLine(sid){
   const {d,company}=current();
-  const s=(d.sales||[]).find(x=>x.companyId===company.id&&x.id===sid);
+  const s=findCompanySaleById(d,company.id,sid);
   if(!s) return alert('Ligne introuvable');
   if(!requireCaisseCanEditSale(s)) return;
   if(isSaleExerciseLocked(s)) return showAutoNotice('Cet exercice est verrouillé ou clôturé. Modification impossible.','error');
@@ -1726,10 +1755,10 @@ function saveEditCartLine(sid){
   showAutoNotice('Ligne du ticket modifiée.','success');
   if(document.querySelector('#panier.section.active')) renderDash('panier');
 }
-function deleteSale(sid){if(!ensureDataUnlocked('la suppression d’une vente')) return;const {d,company}=current(); const s=(d.sales||[]).find(x=>x.companyId===company.id&&x.id===sid); if(!requireCaisseCanEditSale(s)) return; if(s&&isSaleExerciseLocked(s)) return alert('Cet exercice est verrouillé ou clôturé. Suppression impossible.'); restoreStockFromSaleRecord(d,s); d.sales=d.sales.filter(x=>!(x.companyId===company.id&&x.id===sid)); rebuildMarketplaceOrderReportState(d,s?.marketplaceOrderId); save(d); renderDash('panier')}
-function deleteSaleFromReport(sid){if(!requireAdmin('La caisse ne peut pas supprimer une vente dans l’historique général.')) return;if(!ensureDataUnlocked('la suppression d’une vente du rapport')) return;const {d,company}=current(); const s=(d.sales||[]).find(x=>x.companyId===company.id&&x.id===sid); if(s&&isSaleExerciseLocked(s)) return alert('Cet exercice est verrouillé ou clôturé. Suppression impossible.'); g3ProConfirm('Confirmation de suppression','Supprimer définitivement cette vente du rapport ? Le stock du produit sera recalculé automatiquement.',`confirmDeleteSaleFromReport('${sid}')`,'Supprimer');}
-function confirmDeleteSaleFromReport(sid){if(!ensureDataUnlocked('la suppression d’une vente du rapport')) return;const {d,company}=current(); const s=(d.sales||[]).find(x=>x.companyId===company.id&&x.id===sid); if(!s) return g3ProWarning('Vente introuvable ou déjà supprimée.','Suppression impossible'); restoreStockFromSaleRecord(d,s); d.sales=d.sales.filter(x=>!(x.companyId===company.id&&x.id===sid)); rebuildMarketplaceOrderReportState(d,s?.marketplaceOrderId); save(d); renderDash('rapports')}
-function clearSalesHistory(){if(!requireAdmin('La caisse ne peut pas supprimer l’historique général.')) return;if(!ensureDataUnlocked('la suppression de l’historique général')) return;if(!ensureActiveExerciseEditable()) return;const {d,company}=current(); const companySales=(d.sales||[]).filter(s=>s.companyId===company.id); const total=companySales.length; if(!total) return alert('Aucune vente enregistrée à supprimer.'); if(!confirm('Attention : cette action va supprimer définitivement toutes les ventes enregistrées de cette entreprise et recalculer les stocks concernés. Continuer ?')) return; companySales.forEach(s=>restoreStockFromSaleRecord(d,s)); d.sales=(d.sales||[]).filter(s=>s.companyId!==company.id); (d.orders||[]).forEach(o=>{if(o.companyId===company.id){o.marketplaceReported=false;o.reportSaleIds=[];}}); d.cartClearedAt=d.cartClearedAt||{}; d.cartClearedAt[company.id]=new Date().toISOString(); save(d); alert('Historique des ventes vidé avec succès. Stocks recalculés.'); renderDash('rapports')}
+function deleteSale(sid){if(!ensureDataUnlocked('la suppression d’une vente')) return;const {d,company}=current(); const s=findCompanySaleById(d,company.id,sid); if(!s) return g3ProWarning('Vente introuvable ou déjà supprimée.','Suppression impossible'); if(!requireCaisseCanEditSale(s)) return; if(s&&isSaleExerciseLocked(s)) return alert('Cet exercice est verrouillé ou clôturé. Suppression impossible.'); restoreStockFromSaleRecord(d,s); removeCompanySalesByIds(d,company.id,sid); rebuildMarketplaceOrderReportState(d,s?.marketplaceOrderId); markMarketplaceReportDeletedIfEmpty(d,s?.marketplaceOrderId); save(d); renderDash('panier')}
+function deleteSaleFromReport(sid){if(!requireAdmin('La caisse ne peut pas supprimer une vente dans l’historique général.')) return;if(!ensureDataUnlocked('la suppression d’une vente du rapport')) return;const {d,company}=current(); const s=findCompanySaleById(d,company.id,sid); if(!s) return g3ProWarning('Vente introuvable ou déjà supprimée.','Suppression impossible'); if(s&&isSaleExerciseLocked(s)) return alert('Cet exercice est verrouillé ou clôturé. Suppression impossible.'); g3ProConfirm('Confirmation de suppression','Supprimer définitivement cette vente du rapport ? Le stock du produit sera recalculé automatiquement.',`confirmDeleteSaleFromReport('${sid}')`,'Supprimer');}
+function confirmDeleteSaleFromReport(sid){if(!ensureDataUnlocked('la suppression d’une vente du rapport')) return;const {d,company}=current(); const s=findCompanySaleById(d,company.id,sid); if(!s) return g3ProWarning('Vente introuvable ou déjà supprimée.','Suppression impossible'); restoreStockFromSaleRecord(d,s); removeCompanySalesByIds(d,company.id,sid); rebuildMarketplaceOrderReportState(d,s?.marketplaceOrderId); markMarketplaceReportDeletedIfEmpty(d,s?.marketplaceOrderId); save(d); renderDash('rapports')}
+function clearSalesHistory(){if(!requireAdmin('La caisse ne peut pas supprimer l’historique général.')) return;if(!ensureDataUnlocked('la suppression de l’historique général')) return;if(!ensureActiveExerciseEditable()) return;const {d,company}=current(); const companySales=companySalesRows(d,company.id); const total=companySales.length; if(!total) return alert('Aucune vente enregistrée à supprimer.'); if(!confirm('Attention : cette action va supprimer définitivement toutes les ventes enregistrées de cette entreprise et recalculer les stocks concernés. Continuer ?')) return; companySales.forEach(s=>restoreStockFromSaleRecord(d,s)); d.sales=(d.sales||[]).filter(s=>!saleBelongsToCompany(s,company.id)); (d.orders||[]).forEach(o=>{if(o.companyId===company.id){o.marketplaceReported=false;o.reportSaleIds=[]; if(['Validée','Terminer'].includes(marketplaceValidationValue(o))){o.marketplaceReportDeletedByUser=true; o.marketplaceReportDeletedAt=new Date().toISOString();}}}); d.cartClearedAt=d.cartClearedAt||{}; d.cartClearedAt[company.id]=new Date().toISOString(); save(d); alert('Historique des ventes vidé avec succès. Stocks recalculés.'); renderDash('rapports')}
 
 function freeWatermark(company){return planCode(company)==='FREE'?'<div class="global3Watermark">GLOBAL 3</div>':''}
 
@@ -1765,7 +1794,7 @@ function standaloneInvoiceHTML(company,s,ref,dt){
 }
 function openSalePdfPage(sid){
   const {d,company}=current();
-  const s=(d.sales||[]).find(x=>x.companyId===company.id&&x.id===sid);
+  const s=findCompanySaleById(d,company.id,sid);
   if(!s) return alert('Vente introuvable');
   const lines=getInvoiceGroupSales(d,company,s);
   const ref=s.invoiceGroupId||s.invoiceId||s.id, dt=new Date(s.validatedAt||s.date).toLocaleString('fr-FR');
@@ -1919,7 +1948,7 @@ function standaloneYearManagementHTML(company,sales,obligations){return '<!docty
 function openYearManagementPdfPage(){
   const {d,company}=current();
   /* Impression PDF sans sécurité : le PDF Année de gestion doit s'ouvrir même si le contrôle admin bloque l'interface. */
-  const sales=(d.sales||[]).filter(s=>s.companyId===company.id);
+  const sales=companySalesRows(d,company.id);
   const obligations=getObligations(d,company.id);
   const html=standaloneYearManagementHTML(company,sales,obligations);
   const w=window.open('','_blank');
@@ -1942,7 +1971,7 @@ function getCurrentCompanyCartSales(){
   const {d,company}=current();
   const cid=company.id;
   const cutoff=getCartCutoffDate(d,cid);
-  return (d.sales||[]).filter(s=>s.companyId===cid && (!cutoff || String(s.date||'')>cutoff));
+  return (d.sales||[]).filter(s=>saleBelongsToCompany(s,cid) && (!cutoff || String(s.date||'')>cutoff));
 }
 function validateCart(){
   const {d,company}=current();
@@ -1985,12 +2014,12 @@ function filterSalesByInvoice(){
 }
 function openEditSalePopup(sid){
   const {d,company}=current();
-  const s=(d.sales||[]).find(x=>x.companyId===company.id&&x.id===sid);
+  const s=findCompanySaleById(d,company.id,sid);
   if(!s) return alert('Vente introuvable');
   openEditCartLine(sid);
 }
 
-function printSaleReport(sid){logCaisseAction('Impression facture / reçu','Facture '+sid); const {d,company}=current(); const s=d.sales.find(x=>x.companyId===company.id&&x.id===sid); if(!s) return alert('Vente introuvable'); const lines=getInvoiceGroupSales(d,company,s); const ref=s.invoiceGroupId||s.invoiceId||s.id, dt=new Date(s.validatedAt||s.date).toLocaleString('fr-FR'); shell(`<div class="g2panel printable"><div class="reportActions no-print"><button onclick="show('rapports')">Retour au rapport</button><button onclick="openSalePdfPage('${s.id}')">Imprimer / PDF</button><button onclick="shareText('${secureDocLink(ref)}')">Partager</button></div>${lines.length>1?premiumMultiSaleInvoiceHTML(company,lines,ref,dt):premiumSaleInvoiceHTML(company,s,ref,dt)}</div>`,'rapports')}
+function printSaleReport(sid){logCaisseAction('Impression facture / reçu','Facture '+sid); const {d,company}=current(); const s=findCompanySaleById(d,company.id,sid); if(!s) return alert('Vente introuvable'); const lines=getInvoiceGroupSales(d,company,s); const ref=s.invoiceGroupId||s.invoiceId||s.id, dt=new Date(s.validatedAt||s.date).toLocaleString('fr-FR'); shell(`<div class="g2panel printable"><div class="reportActions no-print"><button onclick="show('rapports')">Retour au rapport</button><button onclick="openSalePdfPage('${s.id}')">Imprimer / PDF</button><button onclick="shareText('${secureDocLink(ref)}')">Partager</button></div>${lines.length>1?premiumMultiSaleInvoiceHTML(company,lines,ref,dt):premiumSaleInvoiceHTML(company,s,ref,dt)}</div>`,'rapports')}
 function localDateISO(d=new Date()){const x=new Date(d); x.setMinutes(x.getMinutes()-x.getTimezoneOffset()); return x.toISOString().slice(0,10)}
 function activeExerciseDefaultDate(){return localDateISO(new Date())}
 function activeExerciseLabel(){return 'Ventes illimitées'}
@@ -2022,6 +2051,18 @@ function rebuildMarketplaceOrderReportState(d,orderId){
   const ids=(d.sales||[]).filter(s=>String(s.marketplaceOrderId||'')===String(orderId)).map(s=>s.id);
   o.reportSaleIds=ids;
   o.marketplaceReported=ids.length>0;
+}
+function markMarketplaceReportDeletedIfEmpty(d,orderId){
+  if(!d||!orderId) return;
+  const o=(d.orders||[]).find(x=>String(x.id||'')===String(orderId));
+  if(!o) return;
+  const hasRemaining=(d.sales||[]).some(s=>String(s.marketplaceOrderId||'')===String(orderId));
+  if(!hasRemaining){
+    o.marketplaceReported=false;
+    o.reportSaleIds=[];
+    o.marketplaceReportDeletedByUser=true;
+    o.marketplaceReportDeletedAt=new Date().toISOString();
+  }
 }
 function bilanJourReport(items,sales){
   const selected=window.__bilanJourDate || activeExerciseDefaultDate();
@@ -2146,7 +2187,7 @@ function openEditContractClientModal(cid){if(!requireAdmin('La caisse ne peut pa
 function closeContractClientModal(){document.getElementById('contractClientModal')?.classList.add('hidden')}
 function contractSaleMonthKey(s){return String(s.date||'').slice(0,7) || new Date().toISOString().slice(0,7)}
 function contractSaleYearKey(s){const d=new Date(s.date||Date.now()); return String(isNaN(d)?new Date().getFullYear():d.getFullYear())}
-function contractClientSales(c){const {d,company}=current(); const cname=String(c?.name||'').toLowerCase(); return (d.sales||[]).filter(s=>s.companyId===company.id&&s.clientType==='contrat'&&(s.clientId===c?.id || String(s.client||'').toLowerCase().includes(cname))).sort((a,b)=>new Date(b.date||0)-new Date(a.date||0))}
+function contractClientSales(c){const {d,company}=current(); const cname=String(c?.name||'').toLowerCase(); return (d.sales||[]).filter(s=>saleBelongsToCompany(s,company.id)&&s.clientType==='contrat'&&(s.clientId===c?.id || String(s.client||'').toLowerCase().includes(cname))).sort((a,b)=>new Date(b.date||0)-new Date(a.date||0))}
 function showContractClientInvoices(cid){const {d,company}=current(); const c=(d.clients||[]).find(x=>x.id===cid&&x.companyId===company.id); if(!c) return alert('Client introuvable'); const sales=contractClientSales(c); const groups={}; sales.forEach(s=>{const key=String(c.mode||'Mensuelle').toLowerCase().includes('trimes')?contractQuarterKey(s):contractSaleMonthKey(s); if(!groups[key]) groups[key]={key,type:c.mode||'Mensuelle',period:key,total:0,count:0}; groups[key].total+=Number(s.total||0); groups[key].count+=1;}); const rows=Object.values(groups).sort((a,b)=>String(b.period).localeCompare(String(a.period))); shell(`<div class="g2panel printable contractInvoicePage"><div class="contractInvoiceHeader no-print"><button onclick="show('contrats')">Retour clients sous contrat</button><button onclick="window.print()">Imprimer la page</button></div><div class="contractInvoiceTitle"><h1>Factures du client sous contrat</h1><p><b>Client :</b> ${esc(c.name)} ${c.phone?' — '+esc(c.phone):''}</p></div><table class="g2table contractInvoiceListTable"><thead><tr><th>Type de facturation</th><th>Période facturée</th><th>Montant</th><th>Action</th></tr></thead><tbody>${rows.map(r=>`<tr><td>${esc(r.type)}</td><td>${esc(r.period)}</td><td>${money(r.total)}</td><td><button class="contractInvoiceBtn" onclick="generateMonthlyClientInvoice('${cid}','', '${r.period}')">Imprimer</button></td></tr>`).join('')||'<tr><td colspan="4">Aucune facture disponible pour ce client.</td></tr>'}</tbody></table></div>`,'contrats')}
 function contractQuarterKey(s){const d=new Date(s.date||Date.now()); const y=isNaN(d)?new Date().getFullYear():d.getFullYear(); const q=Math.floor((isNaN(d)?new Date().getMonth():d.getMonth())/3)+1; return y+'-T'+q}
 function globalSalesReport(items,sales){
@@ -2212,7 +2253,7 @@ function obligationForm(){
     <p class="small darkSmall">Choisissez la base de l’obligation : bénéfices généraux, une catégorie complète, ou un produit/service précis. Pour catégorie et produit/service, le montant est calculé sur le bénéfice de l’exercice actif.</p>
   </div>`
 }
-function getActiveExerciseSales(){const {d,company}=current(); return (d.sales||[]).filter(s=>s.companyId===company.id&&isInActiveExercise(s));}
+function getActiveExerciseSales(){const {d,company}=current(); return (d.sales||[]).filter(s=>saleBelongsToCompany(s,company.id)&&isInActiveExercise(s));}
 function getSelectedObligationSales(){
   const {d,company}=current();
   const y=getObligationYear(), m=getObligationMonth();
@@ -2549,7 +2590,7 @@ function addContractClient(){if(!ensureActiveExerciseEditable()) return;const {d
 function editContractClient(cid){openEditContractClientModal(cid)}
 function deleteContractClient(cid){if(!ensureDataUnlocked('la suppression d’un client contrat')) return;if(!ensureActiveExerciseEditable()) return; g3ProConfirm('Suppression client sous contrat','Supprimer définitivement ce client contrat ? Cette action retirera le client de la liste des contrats.','deleteContractClientConfirmed(\''+cid+'\')','Supprimer')}
 function deleteContractClientConfirmed(cid){const {d,company}=current(); d.clients=(d.clients||[]).filter(c=>!(c.id===cid&&c.companyId===company.id)); save(d); renderDash('contrats'); g3ProInfo('Le client sous contrat a été supprimé avec succès.','Suppression effectuée')}
-function findClientSalesByName(name,periodKey=''){const {d,company}=current(); const n=String(name||'').toLowerCase(); return (d.sales||[]).filter(s=>{const ok=s.companyId===company.id&&s.clientType==='contrat'&&String(s.client||'').toLowerCase().includes(n); if(!ok) return false; if(!periodKey) return true; return contractSaleMonthKey(s)===periodKey || contractQuarterKey(s)===periodKey || contractSaleYearKey(s)===periodKey;}).sort((a,b)=>new Date(a.date||0)-new Date(b.date||0));}
+function findClientSalesByName(name,periodKey=''){const {d,company}=current(); const n=String(name||'').toLowerCase(); return (d.sales||[]).filter(s=>{const ok=saleBelongsToCompany(s,company.id)&&s.clientType==='contrat'&&String(s.client||'').toLowerCase().includes(n); if(!ok) return false; if(!periodKey) return true; return contractSaleMonthKey(s)===periodKey || contractQuarterKey(s)===periodKey || contractSaleYearKey(s)===periodKey;}).sort((a,b)=>new Date(a.date||0)-new Date(b.date||0));}
 function generateMonthlyClientInvoiceByName(encodedName){generateMonthlyClientInvoice('', decodeURIComponent(encodedName||''));}
 function generateMonthlyClientInvoice(cid='', clientName='', periodKey=''){const {d,company}=current(); const c=cid?(d.clients||[]).find(x=>x.id===cid&&x.companyId===company.id):null; const label=clientName || (c?[c.name,c.phone].filter(Boolean).join(' — '):''); const sales=findClientSalesByName(c?.name||label,periodKey); if(!sales.length) return g3ProWarning('Aucune consommation trouvée pour ce client sous contrat. Vérifiez la période sélectionnée ou les ventes enregistrées pour ce client.','Aucune consommation trouvée'); const total=sales.reduce((a,b)=>a+Number(b.total||0),0), remise=c?Number(c.remise||0):0, net=total-(total*remise/100); const now=new Date(), ref='FCM-'+now.toISOString().replace(/[-:.TZ]/g,'').slice(0,12); const periode=periodKey || contractSaleMonthKey(sales[0]); shell(`<div class="g2panel printable"><div class="reportActions no-print"><button onclick="showContractClientInvoices('${cid}')">Retour factures client</button><button onclick="window.print()">Imprimer / PDF</button></div><div class="reportBox monthlyInvoice">${freeWatermark(company)}<h1>FACTURE CLIENT SOUS CONTRAT</h1><h3>${esc(company.name)} — GLOBAL 3 — Période : ${esc(periode)}</h3><div class="ficheSeparator"></div><div class="ficheInfoGrid"><div><b>Référence :</b> ${ref}</div><div><b>Client :</b> ${esc(label)}</div><div><b>Type facturation :</b> ${esc(c?.mode||'Mensuelle')}</div><div><b>Date :</b> ${now.toLocaleString('fr-FR')}</div><div><b>Nombre de lignes :</b> ${sales.length}</div><div><b>Total consommation :</b> ${money(total)}</div><div><b>Remise :</b> ${Number(remise||0)}%</div><div><b>Net à payer :</b> ${money(net)}</div></div><table class="g2table monthlyContractTable"><tr><th>Date</th><th>Service / produit</th><th>Note / Détail</th><th>Quantité</th><th>Prix unitaire</th><th>Total</th><th>Observation</th></tr>${sales.map(s=>`<tr><td>${new Date(s.date).toLocaleString('fr-FR')}</td><td>${esc(s.name)}</td><td>${esc(s.note||s.detail||s.description||'—')}</td><td>${Number(s.qty||1)}</td><td>${money(s.unit||0)}</td><td>${money(s.total||0)}</td><td>${esc(s.obs||'—')}</td></tr>`).join('')}<tr class="total"><td colspan="5">TOTAL CONSOMMATION</td><td>${money(total)}</td><td></td></tr><tr class="total"><td colspan="5">REMISE ${remise}%</td><td>${money(total-net)}</td><td></td></tr><tr class="total"><td colspan="5">NET À PAYER</td><td>${money(net)}</td><td></td></tr></table>${qrBlock(ref,company,net,now.toISOString())}<div class="signatureZone"><span>Signature client</span><span>Cachet / Signature entreprise</span></div></div></div>`,'contrats')}
 function addContractClientFromSale(){if(!ensureDataUnlocked('l’ajout d’un client contrat')) return;if(!ensureActiveExerciseEditable()) return;const {d,company}=current(); if(!assertPlanFeature(company,'contracts','Clients sous contrat réservés aux plans BUSINESS et BUSINESS PLUS.')) return; d.clients=d.clients||[]; const name=$('#ccNamePopup')?.value.trim(); if(!name) return alert('Nom du client obligatoire'); d.clients.push({id:id('cli'),companyId:company.id,name,phone:$('#ccPhonePopup')?.value.trim()||'',mode:$('#ccModePopup')?.value||'MENSUELLE',remise:+($('#ccRemisePopup')?.value||0),obs:$('#ccObsPopup')?.value.trim()||'',createdAt:new Date().toISOString()}); save(d); closeClientContractPopup(); renderDash('vente')}
@@ -2744,7 +2785,7 @@ function syncMarketplaceValidatedOrdersToReport(d,cid){
   let changed=false;
   d.orders.filter(o=>o&&o.companyId===cid).forEach(o=>{
     const v=marketplaceValidationValue(o);
-    const mustReport=(v==='Validée'||v==='Terminer') && !isMarketplaceOrderCancelled(o);
+    const mustReport=(v==='Validée'||v==='Terminer') && !isMarketplaceOrderCancelled(o) && !o.marketplaceReportDeletedByUser;
     const ids=Array.isArray(o.reportSaleIds)?o.reportSaleIds:[];
     const hasReport=o.marketplaceReported && ids.length && ids.every(id=>d.sales.some(s=>s.id===id&&s.marketplaceOrderId===o.id));
     if(mustReport && !hasReport){
@@ -3307,6 +3348,8 @@ function saveMarketplaceOrderStatus(orderId){
     restoreMarketplaceOrderStock(d,o);
     removeMarketplaceOrderFromReport(d,o);
   }else if(validation==='Validée'||validation==='Terminer'){
+    delete o.marketplaceReportDeletedByUser;
+    delete o.marketplaceReportDeletedAt;
     addMarketplaceOrderToReport(d,o);
   }else{
     removeMarketplaceOrderFromReport(d,o);
