@@ -1,9 +1,11 @@
-import { chooseNewest, bindingStatus, ensureD1Schema, json, parseJsonSafe, safeKey, DATA_KEY_DEFAULT } from '../_utils.js';
+import { chooseNewest, bindingStatus, ensureD1Schema, getD1, getKV, json, parseJsonSafe, safeKey, DATA_KEY_DEFAULT } from '../_utils.js';
 
 export async function onRequestGet({ request, env }) {
   const url = new URL(request.url);
   const key = safeKey(url.searchParams.get('key'), DATA_KEY_DEFAULT);
   const status = bindingStatus(env);
+  const kv = getKV(env);
+  const db = getD1(env);
 
   if (!status.kv || !status.d1) {
     return json({
@@ -17,11 +19,11 @@ export async function onRequestGet({ request, env }) {
     }, 503);
   }
 
-  await ensureD1Schema(env.GLOBAL3_DB);
+  await ensureD1Schema(db);
 
-  const rawKv = await env.GLOBAL3_KV.get(key);
+  const rawKv = await kv.get(key);
   const kvData = parseJsonSafe(rawKv);
-  const row = await env.GLOBAL3_DB.prepare('SELECT value FROM global3_data WHERE key = ?1').bind(key).first();
+  const row = await db.prepare('SELECT value FROM global3_data WHERE key = ?1').bind(key).first();
   const d1Data = parseJsonSafe(row && row.value);
   const data = chooseNewest(kvData, d1Data);
   const sources = [];
@@ -30,11 +32,11 @@ export async function onRequestGet({ request, env }) {
 
   // Réparation automatique si une source est vide mais l'autre possède les données.
   if (data && !kvData) {
-    await env.GLOBAL3_KV.put(key, JSON.stringify(data), { metadata: { repairedAt: new Date().toISOString(), source: 'repair-from-d1' } });
+    await kv.put(key, JSON.stringify(data), { metadata: { repairedAt: new Date().toISOString(), source: 'repair-from-d1' } });
   }
   if (data && !d1Data) {
     const updatedAt = String(data.__lastModifiedAt || new Date().toISOString());
-    await env.GLOBAL3_DB.prepare(`INSERT INTO global3_data(key, value, updated_at, source)
+    await db.prepare(`INSERT INTO global3_data(key, value, updated_at, source)
       VALUES (?1, ?2, ?3, 'repair-from-kv')
       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at, source = 'repair-from-kv'`)
       .bind(key, JSON.stringify(data), updatedAt)

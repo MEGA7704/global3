@@ -1,4 +1,4 @@
-import { bindingStatus, ensureD1Schema, json, logEvent, nowIso, readJsonBody, safeKey, sameOrigin, DATA_KEY_DEFAULT } from '../_utils.js';
+import { bindingStatus, ensureD1Schema, getD1, getKV, json, logEvent, nowIso, readJsonBody, safeKey, sameOrigin, DATA_KEY_DEFAULT } from '../_utils.js';
 
 export async function onRequestPost({ request, env }) {
   if (!sameOrigin(request)) {
@@ -6,6 +6,8 @@ export async function onRequestPost({ request, env }) {
   }
 
   const status = bindingStatus(env);
+  const kv = getKV(env);
+  const db = getD1(env);
   if (!status.kv || !status.d1) {
     return json({
       success: false,
@@ -35,13 +37,13 @@ export async function onRequestPost({ request, env }) {
   const errors = [];
 
   try {
-    await ensureD1Schema(env.GLOBAL3_DB);
-    await env.GLOBAL3_DB.prepare(`INSERT INTO global3_data(key, value, updated_at, source)
+    await ensureD1Schema(db);
+    await db.prepare(`INSERT INTO global3_data(key, value, updated_at, source)
       VALUES (?1, ?2, ?3, 'api-online-only')
       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at, source = 'api-online-only'`)
       .bind(key, value, updatedAt)
       .run();
-    await env.GLOBAL3_DB.prepare('INSERT INTO global3_backups(key, value, updated_at, created_at, source) VALUES (?1, ?2, ?3, ?4, ?5)')
+    await db.prepare('INSERT INTO global3_backups(key, value, updated_at, created_at, source) VALUES (?1, ?2, ?3, ?4, ?5)')
       .bind(key, value, updatedAt, nowIso(), 'api-online-only')
       .run();
     d1Saved = true;
@@ -50,8 +52,8 @@ export async function onRequestPost({ request, env }) {
   }
 
   try {
-    await env.GLOBAL3_KV.put(key, value, { metadata: { updatedAt, source: 'api-online-only' } });
-    const verification = await env.GLOBAL3_KV.get(key);
+    await kv.put(key, value, { metadata: { updatedAt, source: 'api-online-only' } });
+    const verification = await kv.get(key);
     kvSaved = !!verification;
     if (!kvSaved) errors.push('KV: lecture de vérification impossible');
   } catch (error) {
@@ -59,7 +61,7 @@ export async function onRequestPost({ request, env }) {
   }
 
   const saved = kvSaved && d1Saved;
-  await logEvent(env.GLOBAL3_DB, saved ? 'save_online_confirmed' : 'save_online_failed', saved ? 'Sauvegarde KV + D1 confirmée' : errors.join(' | '));
+  await logEvent(db, saved ? 'save_online_confirmed' : 'save_online_failed', saved ? 'Sauvegarde KV + D1 confirmée' : errors.join(' | '));
 
   return json({
     success: saved,

@@ -108,9 +108,33 @@ export async function logEvent(db, type, message = '') {
   } catch (_error) {}
 }
 
+export function getKV(env) {
+  return (env && (env.GLOBAL3_KV || env.KV || env.GLOBAL3 || env.DATA_KV)) || null;
+}
+
+export function getD1(env) {
+  return (env && (env.GLOBAL3_DB || env.DB || env.D1 || env.DATA_DB)) || null;
+}
+
 export function bindingStatus(env) {
+  const kvName = env && env.GLOBAL3_KV ? 'GLOBAL3_KV'
+    : env && env.KV ? 'KV'
+    : env && env.GLOBAL3 ? 'GLOBAL3'
+    : env && env.DATA_KV ? 'DATA_KV'
+    : null;
+  const d1Name = env && env.GLOBAL3_DB ? 'GLOBAL3_DB'
+    : env && env.DB ? 'DB'
+    : env && env.D1 ? 'D1'
+    : env && env.DATA_DB ? 'DATA_DB'
+    : null;
   return {
-    kv: !!(env && env.GLOBAL3_KV),
-    d1: !!(env && env.GLOBAL3_DB)
+    kv: !!kvName,
+    d1: !!d1Name,
+    kvName: kvName || 'GLOBAL3_KV',
+    d1Name: d1Name || 'GLOBAL3_DB',
+    expectedKv: 'GLOBAL3_KV',
+    expectedD1: 'GLOBAL3_DB',
+    acceptedKvAliases: ['GLOBAL3_KV', 'KV', 'GLOBAL3', 'DATA_KV'],
+    acceptedD1Aliases: ['GLOBAL3_DB', 'DB', 'D1', 'DATA_DB']
   };
 }
